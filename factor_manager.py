@@ -1,0 +1,271 @@
+import pandas as pd
+import numpy as np
+from typing import Union, List, Dict, Callable, Set, Optional, Tuple
+import warnings
+from scipy import stats
+from functools import wraps
+from enum import Enum
+
+class FactorFrequency(Enum):
+    """因子频率枚举"""
+    TICK = "tick"
+    MINUTE = "minute"
+
+class FactorRegistry:
+    """因子注册管理器"""
+    
+    def __init__(self):
+        self.factors: Dict[str, Dict] = {}  # 存储因子信息
+        self.categories: Dict[str, Set[str]] = {}  # 因子分类
+        self.dependencies: Dict[str, Set[str]] = {}  # 因子依赖关系
+        self.frequencies: Dict[str, FactorFrequency] = {}  # 因子频率
+    
+    def register(self, 
+                name: str, 
+                frequency: FactorFrequency,
+                category: str = 'other',
+                description: str = '',
+                dependencies: List[str] = None) -> Callable:
+        """
+        因子注册装饰器
+        
+        Args:
+            name: 因子名称
+            frequency: 因子频率（TICK/MINUTE）
+            category: 因子类别
+            description: 因子描述
+            dependencies: 依赖的其他因子
+        """
+        def decorator(func: Callable) -> Callable:
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            
+            # 注册因子信息
+            self.factors[name] = {
+                'function': func,
+                'category': category,
+                'description': description,
+                'dependencies': dependencies or [],
+                'frequency': frequency
+            }
+            
+            # 更新分类
+            if category not in self.categories:
+                self.categories[category] = set()
+            self.categories[category].add(name)
+            
+            # 更新依赖关系
+            if dependencies:
+                self.dependencies[name] = set(dependencies)
+            
+            # 更新频率信息
+            self.frequencies[name] = frequency
+            
+            return wrapper
+        return decorator
+    
+    def get_factor_info(self, frequency: Optional[FactorFrequency] = None) -> pd.DataFrame:
+        """
+        获取因子信息
+        
+        Args:
+            frequency: 可选的频率过滤
+            
+        Returns:
+            因子信息DataFrame
+        """
+        records = []
+        for name, info in self.factors.items():
+            if frequency and info['frequency'] != frequency:
+                continue
+                
+            records.append({
+                'name': name,
+                'frequency': info['frequency'].value,
+                'category': info['category'],
+                'description': info['description'],
+                'dependencies': ', '.join(info['dependencies'] or [])
+            })
+        return pd.DataFrame(records)
+    
+    def get_factors_by_category(self, 
+                              category: str,
+                              frequency: Optional[FactorFrequency] = None) -> List[str]:
+        """
+        获取指定类别的因子
+        
+        Args:
+            category: 因子类别
+            frequency: 可选的频率过滤
+            
+        Returns:
+            因子名称列表
+        """
+        factors = list(self.categories.get(category, set()))
+        if frequency:
+            factors = [f for f in factors if self.frequencies[f] == frequency]
+        return factors
+
+class FactorManager:
+    """因子管理器"""
+    
+    # 创建因子注册器实例
+    registry = FactorRegistry()
+    
+    @staticmethod
+    def get_factor_names(frequency: Optional[FactorFrequency] = None) -> List[str]:
+        """获取因子名称"""
+        if frequency:
+            return [name for name, freq in FactorManager.registry.frequencies.items() 
+                   if freq == frequency]
+        return list(FactorManager.registry.factors.keys())
+    
+    @staticmethod
+    def get_factor_info(frequency: Optional[FactorFrequency] = None) -> pd.DataFrame:
+        """获取因子信息"""
+        return FactorManager.registry.get_factor_info(frequency)
+    
+    @staticmethod
+    def get_factor_frequency(factor_name: str) -> Optional[FactorFrequency]:
+        """
+        获取因子的频率
+        
+        Args:
+            factor_name: 因子名称
+            
+        Returns:
+            因子频率，如果因子不存在则返回None
+        """
+        return FactorManager.registry.frequencies.get(factor_name)
+    
+    @staticmethod
+    def calculate_factors(df: pd.DataFrame,
+                         frequency: FactorFrequency,
+                         factor_names: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        计算因子
+        
+        Args:
+            df: 输入数据
+            frequency: 因子频率
+            factor_names: 要计算的因子名称列表，如果为None则显示所有可用因子
+            
+        Returns:
+            计算结果DataFrame
+        """
+        try:
+            if df is None:
+                raise ValueError("输入数据为None")
+                
+            result = df.copy()
+            
+            # 获取要计算的因子
+            if factor_names is None:
+                print("\n请指定要计算的因子名称")
+                print("\n可用的因子列表：")
+                print(FactorManager.get_factor_info())
+                return df
+            elif isinstance(factor_names, str):
+                factor_names = [factor_names]
+                
+            # 检查因子是否存在
+            for name in factor_names:
+                if name not in FactorManager.registry.factors:
+                    raise ValueError(f"因子 '{name}' 不存在")
+                
+            # 获取因子依赖关系
+            dependencies = FactorManager.registry.dependencies
+            
+            # 获取所有需要计算的因子（包括依赖）
+            factors_to_calculate = set(factor_names)
+            for factor in factor_names:
+                if factor in dependencies:
+                    factors_to_calculate.update(dependencies[factor])
+            
+            print(f"\n开始计算因子: {', '.join(factors_to_calculate)}")
+            print(f"数据列名: {list(result.columns)}")
+            print(f"数据形状: {result.shape}")
+            
+            # 按依赖关系顺序计算因子
+            calculated = set()
+            while len(calculated) < len(factors_to_calculate):
+                for name in factors_to_calculate:
+                    if name in calculated:
+                        continue
+                    
+                    # 检查依赖是否满足
+                    deps = dependencies.get(name, set())
+                    if deps and not deps.issubset(calculated):
+                        continue
+                    
+                    # 计算因子
+                    print(f"\n计算因子: {name}")
+                    info = FactorManager.registry.factors[name]
+                    result = info['function'](result)
+                    calculated.add(name)
+            
+            print(f"\n因子计算完成!")
+            return result
+            
+        except Exception as e:
+            print(f"\n错误发生在calculate_factors中:")
+            print(f"错误类型: {type(e).__name__}")
+            print(f"错误信息: {str(e)}")
+            raise
+    
+
+# 示例：注册分钟和Tick因子
+def register_example_factors():
+    """注册示例因子"""
+    
+    # 注册分钟动量因子
+    @FactorManager.registry.register(
+        name="minute_momentum",
+        frequency=FactorFrequency.MINUTE,
+        category="momentum",
+        description="分钟级动量因子"
+    )
+    def calculate_minute_momentum(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+        result = df.copy()
+        result['minute_momentum'] = result.groupby('InstruID')['LastPrice'].pct_change(window)
+        return result
+    
+    # 注册Tick订单流因子
+    @FactorManager.registry.register(
+        name="tick_order_flow",
+        frequency=FactorFrequency.TICK,
+        category="flow",
+        description="Tick级订单流因子"
+    )
+    def calculate_tick_order_flow(df: pd.DataFrame) -> pd.DataFrame:
+        result = df.copy()
+        result['trade_direction'] = 0
+        mask_buy = result['LastPrice'] >= result['AskPrice1']
+        mask_sell = result['LastPrice'] <= result['BidPrice1']
+        result.loc[mask_buy, 'trade_direction'] = 1
+        result.loc[mask_sell, 'trade_direction'] = -1
+        result['order_flow'] = result['trade_direction'] * result['Volume']
+        return result
+    
+
+# 使用示例
+if __name__ == "__main__":
+    # 注册示例因子
+    register_example_factors()
+    
+    # 查看所有因子信息
+    print("\n所有因子信息:")
+    print(FactorManager.get_factor_info())
+    
+    # 查看分钟级因子
+    print("\n分钟级因子:")
+    print(FactorManager.get_factor_info(FactorFrequency.MINUTE))
+    
+    # 查看Tick级因子
+    print("\nTick级因子:")
+    print(FactorManager.get_factor_info(FactorFrequency.TICK))
+    
+    # 查看特定类别的因子
+    print("\n动量类因子:")
+    print(FactorManager.registry.get_factors_by_category('momentum'))
