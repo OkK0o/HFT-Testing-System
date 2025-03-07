@@ -230,12 +230,10 @@ class FactorRegister:
         )
         def calculate_toxicity(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            # 判断交易方向
             result['trade_direction'] = 0
             result.loc[result['LastPrice'] >= result['AskPrice1'], 'trade_direction'] = 1
             result.loc[result['LastPrice'] <= result['BidPrice1'], 'trade_direction'] = -1
             
-            # 计算订单流毒性
             result['signed_volume'] = result['Volume'] * result['trade_direction']
             result['order_flow_toxicity'] = result.groupby('InstruID')['signed_volume'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).sum()
@@ -252,11 +250,9 @@ class FactorRegister:
         )
         def calculate_vsp(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            # 计算收益率和成交量的变化
             returns = result.groupby('InstruID')['LastPrice'].transform(lambda x: x.pct_change())
             volume_change = result.groupby('InstruID')['Volume'].transform(lambda x: x.pct_change())
             
-            # 计算同步概率
             result['volume_synchronized_probability'] = ((returns > 0) == (volume_change > 0)).astype(float)
             result['volume_synchronized_probability'] = result.groupby('InstruID')['volume_synchronized_probability'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).mean()
@@ -288,13 +284,10 @@ class FactorRegister:
         )
         def calculate_price_impact(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            # 计算价格变化
             price_change = result.groupby('InstruID')['LastPrice'].transform(lambda x: abs(x.pct_change()))
-            # 计算标准化成交量
             norm_volume = result.groupby('InstruID')['Volume'].transform(
                 lambda x: x / x.rolling(window=window, min_periods=window//2).std()
             )
-            # 计算价格冲击
             result['price_impact'] = price_change / (norm_volume + 1e-9)
             result['price_impact'] = result.groupby('InstruID')['price_impact'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).mean()
@@ -309,11 +302,8 @@ class FactorRegister:
         )
         def calculate_quote_slope(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
             result = df.copy()
-            # 计算买卖报价差
             quote_diff = (result['AskPrice1'] - result['BidPrice1']) / result['LastPrice']
-            # 计算买卖挂单量和
             volume_sum = result['AskVolume1'] + result['BidVolume1']
-            # 计算报价斜率
             result['quote_slope'] = quote_diff / (volume_sum + 1e-9)
             result['quote_slope'] = result.groupby('InstruID')['quote_slope'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).mean()
@@ -352,20 +342,15 @@ class FactorRegister:
         def calculate_hft_trend(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
             
-            # 计算价格变动方向
             price_direction = result.groupby('InstruID')['LastPrice'].transform(
                 lambda x: np.sign(x - x.shift(1))
             )
             
-            # 计算成交量标准化
             volume_std = result.groupby('InstruID')['Volume'].transform(
                 lambda x: x / x.rolling(window=window, min_periods=window//2).std()
             )
-            
-            # 计算信号强度并添加到DataFrame
             result['signal'] = price_direction * volume_std
             
-            # 计算时间衰减的移动平均
             result['hft_trend'] = result.groupby('InstruID')['signal'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).apply(
                     lambda y: np.sum(y * np.exp(-np.arange(len(y))[::-1]/window))
@@ -385,28 +370,18 @@ class FactorRegister:
         def calculate_micro_momentum(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
             
-            # 计算中间价格
             result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
             
-            # 计算中间价格收益率
             result['mid_returns'] = result.groupby('InstruID')['mid_price'].transform(
                 lambda x: x.pct_change()
             )
-            
-            # 计算成交量权重
             result['volume_weight'] = result.groupby('InstruID')['Volume'].transform(
                 lambda x: x / x.rolling(window=window, min_periods=window//2).sum()
             )
-            
-            # 计算动量信号
             result['microstructure_momentum'] = result['mid_returns'] * result['volume_weight']
-            
-            # 计算加权移动平均
             result['microstructure_momentum'] = result.groupby('InstruID')['microstructure_momentum'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).sum()
             )
-            
-            # 删除中间计算列
             result.drop(['mid_price', 'mid_returns', 'volume_weight'], axis=1, inplace=True)
             
             return result
