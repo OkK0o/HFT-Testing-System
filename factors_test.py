@@ -259,7 +259,7 @@ class FactorsTester:
                     
                     if len(valid_data) < min_sample:
                         continue
-                        
+                    
                     # 因子标准化和去极值
                     factor_values = valid_data[factor]
                     factor_std = (factor_values - factor_values.mean()) / factor_values.std()

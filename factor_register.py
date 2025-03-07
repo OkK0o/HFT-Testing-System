@@ -207,61 +207,208 @@ class FactorRegister:
             return result
         
         @FactorManager.registry.register(
-            name="price_reversal_50",
+            name="amihud_illiquidity",
             frequency=FactorFrequency.TICK,
             category="microstructure",
-            description="50条Tick价格反转"
+            description="Amihud非流动性因子"
+        )
+        def calculate_amihud(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            returns = result.groupby('InstruID')['LastPrice'].transform(lambda x: abs(x.pct_change()))
+            volume = result.groupby('InstruID')['Volume'].transform(lambda x: x * result['LastPrice'])
+            result['amihud_illiquidity'] = returns / (volume + 1e-9)
+            result['amihud_illiquidity'] = result.groupby('InstruID')['amihud_illiquidity'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).mean()
+            )
+            return result
+
+        @FactorManager.registry.register(
+            name="order_flow_toxicity",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="订单流毒性指标"
+        )
+        def calculate_toxicity(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            # 判断交易方向
+            result['trade_direction'] = 0
+            result.loc[result['LastPrice'] >= result['AskPrice1'], 'trade_direction'] = 1
+            result.loc[result['LastPrice'] <= result['BidPrice1'], 'trade_direction'] = -1
+            
+            # 计算订单流毒性
+            result['signed_volume'] = result['Volume'] * result['trade_direction']
+            result['order_flow_toxicity'] = result.groupby('InstruID')['signed_volume'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).sum()
+            ) / (result.groupby('InstruID')['Volume'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).sum()
+            ) + 1e-9)
+            return result
+
+        @FactorManager.registry.register(
+            name="volume_synchronized_probability",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="成交量同步概率"
+        )
+        def calculate_vsp(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            # 计算收益率和成交量的变化
+            returns = result.groupby('InstruID')['LastPrice'].transform(lambda x: x.pct_change())
+            volume_change = result.groupby('InstruID')['Volume'].transform(lambda x: x.pct_change())
+            
+            # 计算同步概率
+            result['volume_synchronized_probability'] = ((returns > 0) == (volume_change > 0)).astype(float)
+            result['volume_synchronized_probability'] = result.groupby('InstruID')['volume_synchronized_probability'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).mean()
+            )
+            return result
+
+        @FactorManager.registry.register(
+            name="bid_ask_pressure",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="买卖压力比率"
+        )
+        def calculate_pressure(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
+            result = df.copy()
+            # 计算买卖压力
+            ask_pressure = result['AskVolume1'] / result['AskPrice1']
+            bid_pressure = result['BidVolume1'] * result['BidPrice1']
+            result['bid_ask_pressure'] = (bid_pressure - ask_pressure) / (bid_pressure + ask_pressure + 1e-9)
+            result['bid_ask_pressure'] = result.groupby('InstruID')['bid_ask_pressure'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).mean()
+            )
+            return result
+
+        @FactorManager.registry.register(
+            name="price_impact",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="价格冲击因子"
+        )
+        def calculate_price_impact(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            # 计算价格变化
+            price_change = result.groupby('InstruID')['LastPrice'].transform(lambda x: abs(x.pct_change()))
+            # 计算标准化成交量
+            norm_volume = result.groupby('InstruID')['Volume'].transform(
+                lambda x: x / x.rolling(window=window, min_periods=window//2).std()
+            )
+            # 计算价格冲击
+            result['price_impact'] = price_change / (norm_volume + 1e-9)
+            result['price_impact'] = result.groupby('InstruID')['price_impact'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).mean()
+            )
+            return result
+
+        @FactorManager.registry.register(
+            name="quote_slope",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="报价斜率"
+        )
+        def calculate_quote_slope(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
+            result = df.copy()
+            # 计算买卖报价差
+            quote_diff = (result['AskPrice1'] - result['BidPrice1']) / result['LastPrice']
+            # 计算买卖挂单量和
+            volume_sum = result['AskVolume1'] + result['BidVolume1']
+            # 计算报价斜率
+            result['quote_slope'] = quote_diff / (volume_sum + 1e-9)
+            result['quote_slope'] = result.groupby('InstruID')['quote_slope'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).mean()
+            )
+            return result
+
+        @FactorManager.registry.register(
+            name="price_reversal",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="价格反转因子"
         )
         def calculate_price_reversal(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
             result = df.copy()
             result['short_return'] = result.groupby('InstruID')['LastPrice'].transform(
                 lambda x: x.pct_change(1)
             )
-            result['price_reversal_50'] = -1 * result.groupby('InstruID')['short_return'].transform(
+            result['price_reversal'] = -1 * result.groupby('InstruID')['short_return'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).mean()
             )
             return result
-        
+
         @FactorManager.registry.register(
-            name="kyle_lambda_100",
+            name="vpin",
             frequency=FactorFrequency.TICK,
             category="microstructure",
-            description="100条Tick Kyle's Lambda (价格影响)"
+            description="成交量导向的概率知情交易指标"
         )
-        def calculate_kyle_lambda(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
-            result = df.copy()
-            
-            # 按合约分组计算
-            for instru_id in result['InstruID'].unique():
-                group = result[result['InstruID'] == instru_id]
-                
-                # 计算收益率和符号成交量
-                returns = group['LastPrice'].pct_change()
-                signed_volume = group['Volume'] * np.sign(returns)
-                
-                # 计算滚动窗口的协方差和方差
-                returns_mean = returns.rolling(window=window, min_periods=window//2).mean()
-                volume_mean = signed_volume.rolling(window=window, min_periods=window//2).mean()
-                cov_xy = (returns * signed_volume).rolling(window=window, min_periods=window//2).mean() - returns_mean * volume_mean
-                var_y = signed_volume.rolling(window=window, min_periods=window//2).var()
-                
-                # 计算Kyle's Lambda
-                result.loc[result['InstruID'] == instru_id, 'kyle_lambda_100'] = cov_xy / (var_y + 1e-9)
-            
-            return result
+
         @FactorManager.registry.register(
-            name="unit_return_volume",
+            name="hft_trend",
             frequency=FactorFrequency.TICK,
             category="microstructure",
-            description="单位收益率成交量"
+            description="高频趋势因子"
         )
-        def calculate_unitreturn_volume(df: pd.DataFrame) -> pd.DataFrame:
+        def calculate_hft_trend(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            result['unit_return_volume'] = result.groupby('InstruID')['LastPrice'].transform(
-                lambda x: x.pct_change() * result.groupby('InstruID')['Volume'].transform(
-                    lambda x: x.rolling(window=100, min_periods=100//2).mean()
+            
+            # 计算价格变动方向
+            price_direction = result.groupby('InstruID')['LastPrice'].transform(
+                lambda x: np.sign(x - x.shift(1))
+            )
+            
+            # 计算成交量标准化
+            volume_std = result.groupby('InstruID')['Volume'].transform(
+                lambda x: x / x.rolling(window=window, min_periods=window//2).std()
+            )
+            
+            # 计算信号强度并添加到DataFrame
+            result['signal'] = price_direction * volume_std
+            
+            # 计算时间衰减的移动平均
+            result['hft_trend'] = result.groupby('InstruID')['signal'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).apply(
+                    lambda y: np.sum(y * np.exp(-np.arange(len(y))[::-1]/window))
                 )
             )
+            
+            result.drop('signal', axis=1, inplace=True)
+            
+            return result
+
+        @FactorManager.registry.register(
+            name="microstructure_momentum",
+            frequency=FactorFrequency.TICK,
+            category="microstructure",
+            description="微观结构动量因子"
+        )
+        def calculate_micro_momentum(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            
+            # 计算中间价格
+            result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+            
+            # 计算中间价格收益率
+            result['mid_returns'] = result.groupby('InstruID')['mid_price'].transform(
+                lambda x: x.pct_change()
+            )
+            
+            # 计算成交量权重
+            result['volume_weight'] = result.groupby('InstruID')['Volume'].transform(
+                lambda x: x / x.rolling(window=window, min_periods=window//2).sum()
+            )
+            
+            # 计算动量信号
+            result['microstructure_momentum'] = result['mid_returns'] * result['volume_weight']
+            
+            # 计算加权移动平均
+            result['microstructure_momentum'] = result.groupby('InstruID')['microstructure_momentum'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).sum()
+            )
+            
+            # 删除中间计算列
+            result.drop(['mid_price', 'mid_returns', 'volume_weight'], axis=1, inplace=True)
+            
             return result
 
 def register_all_factors():
