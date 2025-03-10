@@ -179,6 +179,7 @@ class FinDataProcessor:
                      - 'vwap': 成交量加权平均价格
                      - 'spread': 买卖价差
                      - 'depth_imbalance': 盘口深度不平衡
+                     - 'mid_price': 中间价格
                      
         Returns:
             添加特征后的DataFrame
@@ -186,15 +187,29 @@ class FinDataProcessor:
         df = df.copy()
         
         if features is None:
-            features = ['returns', 'vol', 'vwap', 'spread', 'depth_imbalance']
+            features = ['returns', 'vol', 'vwap', 'spread', 'depth_imbalance', 'mid_price']
+        
+        # 首先计算中间价，因为其他特征可能会用到
+        if 'mid_price' in features:
+            # 处理涨跌停情况下的中间价计算
+            df['mid_price'] = np.where(
+                (df['AskPrice1'] == 0) & (df['BidPrice1'] != 0),  # 涨停情况
+                df['BidPrice1'],
+                np.where(
+                    (df['BidPrice1'] == 0) & (df['AskPrice1'] != 0),  # 跌停情况
+                    df['AskPrice1'],
+                    (df['AskPrice1'] + df['BidPrice1']) / 2  # 正常情况
+                )
+            )
         
         for feature in features:
             if feature == 'returns':
-                # 计算收益率
-                df['returns'] = df.groupby('InstruID')['LastPrice'].pct_change()
+                # 使用中间价计算收益率
+                price_col = 'mid_price' if 'mid_price' in df.columns else 'LastPrice'
+                df['returns'] = df.groupby('InstruID')[price_col].pct_change()
                 
             elif feature == 'vol':
-                # 计算实现波动率（5分钟）
+                # 使用中间价计算波动率
                 window = 300  # 5分钟 = 300秒
                 df['vol'] = df.groupby('InstruID')['returns'].rolling(
                     window=window, min_periods=1
@@ -284,7 +299,7 @@ class FinDataProcessor:
     def resample_data(self,
                      df: pd.DataFrame,
                      freq: str = '1min',
-                     price_col: str = 'LastPrice',
+                     price_col: str = 'mid_price',  # 默认使用中间价
                      volume_col: str = 'Volume',
                      agg_dict: Dict = None) -> pd.DataFrame:
         """
@@ -293,7 +308,7 @@ class FinDataProcessor:
         Args:
             df: 输入DataFrame
             freq: 重采样频率，如'1min', '5min', '1H'
-            price_col: 价格列名
+            price_col: 价格列名，默认使用中间价
             volume_col: 成交量列名
             agg_dict: 自定义聚合字典
             
@@ -301,6 +316,10 @@ class FinDataProcessor:
             重采样后的DataFrame
         """
         df = df.copy()
+        
+        # 如果没有中间价，先计算中间价
+        if price_col == 'mid_price' and 'mid_price' not in df.columns:
+            df = self.add_features(df, features=['mid_price'])
         
         # 默认的聚合方式
         if agg_dict is None:
@@ -314,7 +333,8 @@ class FinDataProcessor:
                 'BidPrice1': 'last',                 # 买一价取最后一个
                 'AskPrice1': 'last',                 # 卖一价取最后一个
                 'BidVolume1': 'last',               # 买一量取最后一个
-                'AskVolume1': 'last'                # 卖一量取最后一个
+                'AskVolume1': 'last',               # 卖一量取最后一个
+                'mid_price': 'last'                 # 中间价取最后一个
             }
         
         # 按合约分组重采样
