@@ -110,7 +110,6 @@ class FactorRegistry:
 class FactorManager:
     """因子管理器"""
     
-    # 创建因子注册器实例
     registry = FactorRegistry()
     
     @staticmethod
@@ -160,7 +159,6 @@ class FactorManager:
                 
             result = df.copy()
             
-            # 获取要计算的因子
             if factor_names is None:
                 print("\n请指定要计算的因子名称")
                 print("\n可用的因子列表：")
@@ -168,16 +166,12 @@ class FactorManager:
                 return df
             elif isinstance(factor_names, str):
                 factor_names = [factor_names]
-                
-            # 检查因子是否存在
             for name in factor_names:
                 if name not in FactorManager.registry.factors:
                     raise ValueError(f"因子 '{name}' 不存在")
                 
-            # 获取因子依赖关系
             dependencies = FactorManager.registry.dependencies
             
-            # 获取所有需要计算的因子（包括依赖）
             factors_to_calculate = set(factor_names)
             for factor in factor_names:
                 if factor in dependencies:
@@ -187,19 +181,16 @@ class FactorManager:
             print(f"数据列名: {list(result.columns)}")
             print(f"数据形状: {result.shape}")
             
-            # 按依赖关系顺序计算因子
             calculated = set()
             while len(calculated) < len(factors_to_calculate):
                 for name in factors_to_calculate:
                     if name in calculated:
                         continue
                     
-                    # 检查依赖是否满足
                     deps = dependencies.get(name, set())
                     if deps and not deps.issubset(calculated):
                         continue
                     
-                    # 计算因子
                     print(f"\n计算因子: {name}")
                     info = FactorManager.registry.factors[name]
                     result = info['function'](result)
@@ -215,11 +206,9 @@ class FactorManager:
             raise
     
 
-# 示例：注册分钟和Tick因子
 def register_example_factors():
     """注册示例因子"""
     
-    # 注册分钟动量因子
     @FactorManager.registry.register(
         name="minute_momentum",
         frequency=FactorFrequency.MINUTE,
@@ -231,7 +220,6 @@ def register_example_factors():
         result['minute_momentum'] = result.groupby('InstruID')['LastPrice'].pct_change(window)
         return result
     
-    # 注册Tick订单流因子
     @FactorManager.registry.register(
         name="tick_order_flow",
         frequency=FactorFrequency.TICK,
@@ -254,18 +242,9 @@ if __name__ == "__main__":
     # 注册示例因子
     register_example_factors()
     
-    # 查看所有因子信息
     print("\n所有因子信息:")
     print(FactorManager.get_factor_info())
     
-    # 查看分钟级因子
-    print("\n分钟级因子:")
-    print(FactorManager.get_factor_info(FactorFrequency.MINUTE))
-    
-    # 查看Tick级因子
-    print("\nTick级因子:")
-    print(FactorManager.get_factor_info(FactorFrequency.TICK))
-    
-    # 查看特定类别的因子
+
     print("\n动量类因子:")
     print(FactorManager.registry.get_factors_by_category('momentum'))

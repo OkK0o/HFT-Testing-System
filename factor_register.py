@@ -13,7 +13,10 @@ class FactorRegister:
         'volatility': '波动率类因子', 
         'volume': '成交量类因子',
         'orderbook': '订单簿类因子',
-        'microstructure': '市场微观结构类因子'
+        'microstructure': '市场微观结构类因子',
+        'time': '时间特征类因子',
+        'term_structure': '期限结构类因子',
+        'composite': '复合类因子'
     """
     
     @staticmethod
@@ -386,6 +389,101 @@ class FactorRegister:
             
             return result
 
+    @staticmethod
+    def register_time_factors():
+        """时间特征类因子"""
+        @FactorManager.registry.register(
+            name="time_decay",
+            frequency=FactorFrequency.TICK,
+            category="time",
+            description="交易时间衰减因子"
+        )
+        def calculate_time_decay(df: pd.DataFrame) -> pd.DataFrame:
+            result = df.copy()
+            # 将时间转换为分钟数（距离开盘）
+            result['minute_from_open'] = pd.to_datetime(result['UpdateTime']).dt.hour * 60 + \
+                                       pd.to_datetime(result['UpdateTime']).dt.minute - 570  # 9:30 = 570分钟
+            # 计算时间衰减
+            result['time_decay'] = np.exp(-result['minute_from_open'] / 120)  # 2小时半衰期
+            result.drop('minute_from_open', axis=1, inplace=True)
+            return result
+
+        @FactorManager.registry.register(
+            name="intraday_seasonality",
+            frequency=FactorFrequency.TICK,
+            category="time",
+            description="日内季节性因子"
+        )
+        def calculate_intraday_seasonality(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            result['minute'] = pd.to_datetime(result['UpdateTime']).dt.minute
+            result['price_change'] = result.groupby('InstruID')['LastPrice'].transform(
+                lambda x: x.pct_change()
+            )
+            result['intraday_seasonality'] = result.groupby(['InstruID', 'minute'])['price_change'].transform(
+                lambda x: x.rolling(window=window, min_periods=window//2).mean()
+            )
+            result.drop(['minute', 'price_change'], axis=1, inplace=True)
+            return result
+
+    @staticmethod
+    def register_term_structure_factors():
+        """期限结构类因子"""
+        @FactorManager.registry.register(
+            name="term_premium",
+            frequency=FactorFrequency.TICK,
+            category="term_structure",
+            description="期限溢价因子"
+        )
+        def calculate_term_premium(df: pd.DataFrame) -> pd.DataFrame:
+            result = df.copy()
+            result['term_premium'] = result['LastPrice'] * (252 / (result['days_to_expiry'] + 1))
+            return result
+
+    @staticmethod
+    def register_composite_factors():
+        """复合类因子"""
+        @FactorManager.registry.register(
+            name="volume_price_trend",
+            frequency=FactorFrequency.TICK,
+            category="composite",
+            description="成交量加权价格趋势因子"
+        )
+        def calculate_volume_price_trend(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
+            result = df.copy()
+            # 计算价格趋势
+            result['price_trend'] = result.groupby('InstruID')['LastPrice'].transform(
+                lambda x: x.pct_change(window)
+            )
+            # 计算相对成交量
+            result['rel_volume'] = result.groupby('InstruID')['Volume'].transform(
+                lambda x: x / x.rolling(window=window, min_periods=window//2).mean()
+            )
+            # 综合因子
+            result['volume_price_trend'] = result['price_trend'] * result['rel_volume']
+            result.drop(['price_trend', 'rel_volume'], axis=1, inplace=True)
+            return result
+
+        @FactorManager.registry.register(
+            name="liquidity_adjusted_momentum",
+            frequency=FactorFrequency.TICK,
+            category="composite",
+            description="流动性调整后的动量因子"
+        )
+        def calculate_liquidity_adjusted_momentum(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
+            result = df.copy()
+            # 计算动量
+            result['momentum'] = result.groupby('InstruID')['LastPrice'].transform(
+                lambda x: x.pct_change(window)
+            )
+            # 计算流动性指标（使用spread和depth_imbalance）
+            result['liquidity_score'] = 1 / (result['spread'] * (1 + abs(result['depth_imbalance'])))
+            # 计算调整后的动量
+            result['liquidity_adjusted_momentum'] = result['momentum'] * result['liquidity_score']
+            result.drop(['momentum', 'liquidity_score'], axis=1, inplace=True)
+            return result
+
+
 def register_all_factors():
     """注册所有因子"""
     register = FactorRegister()
@@ -394,3 +492,6 @@ def register_all_factors():
     register.register_volume_factors()        # 成交量类因子
     register.register_orderbook_factors()     # 订单簿类因子
     register.register_microstructure_factors()  # 市场微观结构类因子
+    register.register_time_factors()          # 时间特征类因子
+    register.register_term_structure_factors()  # 期限结构类因子
+    register.register_composite_factors()      # 复合类因子

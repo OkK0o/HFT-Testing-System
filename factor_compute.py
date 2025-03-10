@@ -23,11 +23,9 @@ def run_factor_compute(df: pd.DataFrame,
         save_path: 结果保存路径
         return_periods: 自定义收益率计算周期列表，如[1, 5, 10, 20]
     """
-    # 注册所有因子
     register_all_factors()
     
     if factor_name is not None:
-        # 检查因子是否存在
         factor_freq = FactorManager.get_factor_frequency(factor_name)
         if factor_freq is None:
             print(f"\n错误：因子 '{factor_name}' 不存在")
@@ -39,51 +37,38 @@ def run_factor_compute(df: pd.DataFrame,
         periods = return_periods if return_periods is not None else [1, 5, 10, 20]
         print(f"\n计算收益率周期: {periods}")
         
-        # 更新config中的return_periods
         if config is None:
             config = FactorTestConfig(return_periods=periods)
         else:
             config.return_periods = periods
             
-        # 创建因子测试器
         tester = FactorsTester(
             save_path=save_path,
             config=config
         )
             
-        # 保持原始数据
         data = df.copy()
         print(f"\n原始数据形状: {data.shape}")
-            
-        # 测试单个因子
         if factor_freq == FactorFrequency.TICK:
-            # 计算tick因子
             factor_df = FactorManager.calculate_factors(df, frequency=FactorFrequency.TICK, factor_names=factor_name)
             if factor_name in factor_df.columns:
                 data[factor_name] = factor_df[factor_name]
         else:
-            # 计算分钟因子
             data_processor = FinDataProcessor("data")
             minute_df = data_processor.resample_data(df, freq='1min')
             minute_df['TradDay'] = minute_df['DateTime'].dt.date
             factor_df = FactorManager.calculate_factors(minute_df, frequency=FactorFrequency.MINUTE, factor_names=factor_name)
             if factor_name in factor_df.columns:
-                # 将因子值合并回原始数据
                 data = data.merge(factor_df[['DateTime', factor_name]], 
                                 on='DateTime', 
                                 how='left')
         
         print(f"\n添加因子后数据形状: {data.shape}")
-        
-        # 计算未来收益率
         data = FactorsTester.calculate_forward_returns(data, periods=periods)
         print(f"\n添加收益率后数据形状: {data.shape}")
-        
-        # 测试因子
         results = tester.test_single_factor(factor_name, data, config)
         return results
     else:
-        # 显示所有已注册因子
         print("\n=== 所有已注册因子 ===")
         all_factors = FactorManager.get_factor_info()
         print(all_factors)
@@ -120,7 +105,6 @@ def compute_factor(df: pd.DataFrame, factor_name: str) -> pd.DataFrame:
             minute_df['TradDay'] = minute_df['DateTime'].dt.date
             factor_df = FactorManager.calculate_factors(minute_df, frequency=FactorFrequency.MINUTE, factor_names=factor_name)
             if factor_name in factor_df.columns:
-                # 将因子值添加回原始数据（通过DateTime对齐）
                 result_df = result_df.merge(factor_df[['DateTime', factor_name]], 
                                           on='DateTime', 
                                           how='left')
