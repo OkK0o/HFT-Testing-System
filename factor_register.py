@@ -392,21 +392,6 @@ class FactorRegister:
     @staticmethod
     def register_time_factors():
         """时间特征类因子"""
-        @FactorManager.registry.register(
-            name="time_decay",
-            frequency=FactorFrequency.TICK,
-            category="time",
-            description="交易时间衰减因子"
-        )
-        def calculate_time_decay(df: pd.DataFrame) -> pd.DataFrame:
-            result = df.copy()
-            # 将时间转换为分钟数（距离开盘）
-            result['minute_from_open'] = pd.to_datetime(result['UpdateTime']).dt.hour * 60 + \
-                                       pd.to_datetime(result['UpdateTime']).dt.minute - 570  # 9:30 = 570分钟
-            # 计算时间衰减
-            result['time_decay'] = np.exp(-result['minute_from_open'] / 120)  # 2小时半衰期
-            result.drop('minute_from_open', axis=1, inplace=True)
-            return result
 
         @FactorManager.registry.register(
             name="intraday_seasonality",
@@ -451,15 +436,12 @@ class FactorRegister:
         )
         def calculate_volume_price_trend(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
             result = df.copy()
-            # 计算价格趋势
             result['price_trend'] = result.groupby('InstruID')['LastPrice'].transform(
                 lambda x: x.pct_change(window)
             )
-            # 计算相对成交量
             result['rel_volume'] = result.groupby('InstruID')['Volume'].transform(
                 lambda x: x / x.rolling(window=window, min_periods=window//2).mean()
             )
-            # 综合因子
             result['volume_price_trend'] = result['price_trend'] * result['rel_volume']
             result.drop(['price_trend', 'rel_volume'], axis=1, inplace=True)
             return result
@@ -472,13 +454,10 @@ class FactorRegister:
         )
         def calculate_liquidity_adjusted_momentum(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            # 计算动量
             result['momentum'] = result.groupby('InstruID')['LastPrice'].transform(
                 lambda x: x.pct_change(window)
             )
-            # 计算流动性指标（使用spread和depth_imbalance）
             result['liquidity_score'] = 1 / (result['spread'] * (1 + abs(result['depth_imbalance'])))
-            # 计算调整后的动量
             result['liquidity_adjusted_momentum'] = result['momentum'] * result['liquidity_score']
             result.drop(['momentum', 'liquidity_score'], axis=1, inplace=True)
             return result

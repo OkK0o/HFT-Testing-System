@@ -483,7 +483,6 @@ class FactorsTester:
             period: 收益率周期
             factor_name: 因子名称
         """
-        # 检查结果的完整性
         if not all(key in results for key in ['quantile_returns', 'long_short_returns', 'performance_metrics']):
             print(f"警告：回测结果字典缺少必要的键")
             return
@@ -500,7 +499,6 @@ class FactorsTester:
             print(f"警告：周期 {period} 的绩效指标数据不存在")
             return
             
-        # 检查数据的有效性
         quantile_returns = results['quantile_returns'][period]
         long_short_returns = results['long_short_returns'][period]
         performance = results['performance_metrics'][period]
@@ -509,15 +507,12 @@ class FactorsTester:
             print(f"警告：周期 {period} 的回测结果数据为空")
             return
             
-        # 设置绘图样式
         plt.style.use('seaborn')
         plt.rcParams['axes.unicode_minus'] = False
         
         try:
-            # 创建图形
             fig, axes = plt.subplots(2, 2, figsize=(20, 16))
             
-            # 1. 累积收益率曲线
             ax1 = axes[0, 0]
             cum_returns = (1 + quantile_returns).cumprod()
             cum_returns.plot(ax=ax1)
@@ -527,7 +522,6 @@ class FactorsTester:
             ax1.legend([f'Q{i+1}' for i in range(len(quantile_returns.columns))])
             ax1.grid(True)
             
-            # 2. 多空组合累积收益率
             ax2 = axes[0, 1]
             cum_long_short = (1 + long_short_returns).cumprod()
             cum_long_short.plot(ax=ax2)
@@ -536,10 +530,8 @@ class FactorsTester:
             ax2.set_ylabel('Cumulative Returns')
             ax2.grid(True)
             
-            # 3. 绩效指标热力图
             ax3 = axes[1, 0]
             
-            # 使用英文指标名称
             metric_names = {
                 'cumulative_return': 'Cumulative Return',
                 'annual_return': 'Annual Return',
@@ -560,7 +552,6 @@ class FactorsTester:
             ax3.set_xticklabels(ax3.get_xticklabels(), rotation=45, ha='right')
             ax3.set_yticklabels(ax3.get_yticklabels())
             
-            # 4. 分位数平均收益率柱状图
             ax4 = axes[1, 1]
             mean_returns = quantile_returns.mean()
             mean_returns.plot(kind='bar', ax=ax4)
@@ -606,11 +597,9 @@ class FactorsTester:
         """
         results = {}
         
-        # 确保因子值和交易日期都是有效的
         df = df.copy()
         df = df.dropna(subset=[factor_name])
         
-        # 检查数据有效性
         if df.empty:
             print(f"警告：{factor_name} 的所有数据都是无效的")
             return {
@@ -619,19 +608,15 @@ class FactorsTester:
                 'performance_metrics': {}
             }
             
-        # 按日期和合约分组计算分位数
         def safe_qcut(x):
             try:
-                # 检查数据有效性
                 x = x.dropna()
                 if len(x) < n_quantiles:
                     return pd.Series(index=x.index)
                     
-                # 检查是否所有值都相同
                 if x.nunique() == 1:
                     return pd.Series(0, index=x.index)
                     
-                # 计算分位数
                 result = pd.qcut(x, n_quantiles, labels=False, duplicates='drop')
                 return result
                 
@@ -639,10 +624,8 @@ class FactorsTester:
                 print(f"警告：分位数计算出错 - {str(e)}")
                 return pd.Series(index=x.index)
         
-        # 按日期分组计算分位数
         df['quantile'] = df.groupby('TradDay')[factor_name].transform(safe_qcut)
         
-        # 计算各分位数的收益率序列
         quantile_returns = {}
         long_short_returns = {}
         
@@ -652,31 +635,24 @@ class FactorsTester:
                 print(f"警告：{return_col} 不在数据列中")
                 continue
             
-            # 去除无效的分位数和收益率
             valid_data = df.dropna(subset=['quantile', return_col])
             if valid_data.empty:
                 print(f"警告：{period}期数据全部无效")
                 continue
             
             try:
-                # 计算各分位数的收益率
                 period_returns = valid_data.groupby(['TradDay', 'quantile'])[return_col].mean()
                 if period_returns.empty:
                     print(f"警告：{period}期收益率计算结果为空")
                     continue
-                
-                # 重构索引
                 period_returns = period_returns.unstack()
                 if not period_returns.empty:
                     quantile_returns[period] = period_returns
-                    
-                    # 计算多空组合收益率（最高分位数减最低分位数）
                     highest_quantile = period_returns.columns.max()
                     lowest_quantile = period_returns.columns.min()
                     
                     if highest_quantile is not None and lowest_quantile is not None:
                         long_short = period_returns[highest_quantile] - period_returns[lowest_quantile]
-                        # 考虑双边手续费
                         long_short = long_short - 2 * commission_rate
                         long_short_returns[period] = long_short
                     else:
@@ -697,22 +673,18 @@ class FactorsTester:
         results['quantile_returns'] = quantile_returns
         results['long_short_returns'] = long_short_returns
         
-        # 计算绩效指标
         performance_metrics = {}
         for period in return_periods:
             if period not in quantile_returns or period not in long_short_returns:
                 continue
                 
             period_metrics = {}
-            
-            # 计算各分位数的绩效指标
             for q in quantile_returns[period].columns:
                 returns = quantile_returns[period][q]
                 if not returns.empty and not returns.isna().all():
                     metrics = FactorsTester._calculate_performance_metrics(returns)
                     period_metrics[f'quantile_{q}'] = metrics
             
-            # 计算多空组合的绩效指标
             if not long_short_returns[period].empty and not long_short_returns[period].isna().all():
                 long_short_metrics = FactorsTester._calculate_performance_metrics(
                     long_short_returns[period]
@@ -739,28 +711,22 @@ class FactorsTester:
         """
         metrics = {}
         
-        # 累积收益率
         metrics['cumulative_return'] = (1 + returns).prod() - 1
         
-        # 年化收益率
-        n_years = len(returns) / 252  # 假设252个交易日
+        n_years = len(returns) / 252 
         metrics['annual_return'] = (1 + metrics['cumulative_return']) ** (1/n_years) - 1
         
-        # 年化波动率
         metrics['annual_volatility'] = returns.std() * np.sqrt(252)
         
-        # 夏普比率
-        risk_free_rate = 0.02  # 假设无风险利率为2%
+        risk_free_rate = 0.02
         excess_returns = returns - risk_free_rate/252
         metrics['sharpe_ratio'] = np.sqrt(252) * excess_returns.mean() / returns.std() if returns.std() != 0 else np.nan
         
-        # 最大回撤
         cum_returns = (1 + returns).cumprod()
         rolling_max = cum_returns.expanding().max()
         drawdowns = cum_returns / rolling_max - 1
         metrics['max_drawdown'] = drawdowns.min()
         
-        # 胜率
         metrics['win_rate'] = (returns > 0).mean()
         
         return metrics
@@ -785,7 +751,6 @@ class FactorsTester:
             
         print(f"\n=== 开始测试因子: {factor_name} ===")
         
-        # 1. 计算因子IC
         ic_stats = self.calculate_ic(
             data,
             factor_names=factor_name,
@@ -794,7 +759,6 @@ class FactorsTester:
             min_sample=config.min_sample_size
         )
         
-        # 2. 计算IC时间序列
         ic_series = self.calculate_ic_series(
             data,
             factor_names=factor_name,
@@ -803,7 +767,6 @@ class FactorsTester:
             min_sample=config.min_sample_size
         )
         
-        # 3. 进行分位数回测
         quantile_results = self.quantile_backtest(
             df=data,
             factor_name=factor_name,
@@ -812,7 +775,6 @@ class FactorsTester:
             commission_rate=config.commission_rate
         )
         
-        # 4. 评估因子有效性
         evaluation = self._evaluate_factor(ic_stats, ic_series[factor_name], config)
         
         results = {
@@ -823,11 +785,8 @@ class FactorsTester:
             'evaluation': evaluation
         }
         
-        # 打印评估结果
         self._print_evaluation(results)
         
-        # 绘制分位数回测结果
-        # 使用配置中指定的最大周期进行绘图
         max_period = max(config.return_periods)
         if max_period in quantile_results.get('quantile_returns', {}):
             self.plot_quantile_results(
@@ -860,13 +819,11 @@ class FactorsTester:
             print(f"警告：{ic_col} 不在IC序列中")
             return evaluation
         
-        # 获取非空的IC值序列
         ic_values = ic_series[ic_col].dropna()
         if len(ic_values) == 0:
             print(f"警告：{ic_col} 的IC序列全为空值")
             return evaluation
         
-        # 1. 评估IC均值
         ic_mean = ic_values.mean()
         evaluation['metrics']['ic_mean'] = ic_mean
         if abs(ic_mean) >= config.ic_threshold:
@@ -875,7 +832,6 @@ class FactorsTester:
         else:
             evaluation['comments'].append(f"IC均值({ic_mean:.4f})未通过阈值检验")
             
-        # 2. 评估IR
         ic_std = ic_values.std()
         ir = ic_mean / ic_std if ic_std != 0 else 0
         evaluation['metrics']['ir'] = ir
@@ -885,7 +841,6 @@ class FactorsTester:
         else:
             evaluation['comments'].append(f"IR({ir:.4f})未通过阈值检验")
             
-        # 3. 评估t统计量
         n_samples = len(ic_values)
         t_stat = ic_mean / (ic_std / np.sqrt(n_samples)) if ic_std != 0 else 0
         evaluation['metrics']['t_stat'] = t_stat
@@ -895,7 +850,6 @@ class FactorsTester:
         else:
             evaluation['comments'].append(f"t统计量({t_stat:.4f})未通过阈值检验")
             
-        # 4. 评估IC方向的稳定性
         ic_positive_ratio = (ic_values > 0).mean()
         evaluation['metrics']['ic_positive_ratio'] = ic_positive_ratio
         direction_stable = abs(ic_positive_ratio - 0.5) >= 0.1
@@ -905,11 +859,9 @@ class FactorsTester:
         else:
             evaluation['comments'].append(f"IC方向不够稳定(positive_ratio={ic_positive_ratio:.4f})")
             
-        # 添加样本量信息
         evaluation['metrics']['n_samples'] = n_samples
         evaluation['comments'].append(f"有效样本量: {n_samples}")
             
-        # 判断因子是否有效
         evaluation['is_effective'] = evaluation['score'] >= 3
         
         return evaluation

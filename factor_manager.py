@@ -41,7 +41,6 @@ class FactorRegistry:
             def wrapper(*args, **kwargs):
                 return func(*args, **kwargs)
             
-            # 注册因子信息
             self.factors[name] = {
                 'function': func,
                 'category': category,
@@ -55,11 +54,9 @@ class FactorRegistry:
                 self.categories[category] = set()
             self.categories[category].add(name)
             
-            # 更新依赖关系
             if dependencies:
                 self.dependencies[name] = set(dependencies)
             
-            # 更新频率信息
             self.frequencies[name] = frequency
             
             return wrapper
