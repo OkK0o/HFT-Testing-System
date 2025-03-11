@@ -74,7 +74,7 @@ class FactorRegistry:
         """
         records = []
         for name, info in self.factors.items():
-            if frequency and info['frequency'] != frequency:
+            if frequency and info['frequency'].value != frequency.value:
                 continue
                 
             records.append({
@@ -101,7 +101,7 @@ class FactorRegistry:
         """
         factors = list(self.categories.get(category, set()))
         if frequency:
-            factors = [f for f in factors if self.frequencies[f] == frequency]
+            factors = [f for f in factors if self.frequencies[f].value == frequency.value]
         return factors
 
 class FactorManager:
@@ -114,7 +114,7 @@ class FactorManager:
         """获取因子名称"""
         if frequency:
             return [name for name, freq in FactorManager.registry.frequencies.items() 
-                   if freq == frequency]
+                   if freq.value == frequency.value]
         return list(FactorManager.registry.factors.keys())
     
     @staticmethod

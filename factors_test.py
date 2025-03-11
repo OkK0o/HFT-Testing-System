@@ -17,7 +17,7 @@ class FactorTestConfig:
     """因子测试配置类"""
     ic_method: str = 'spearman'
     return_periods: List[int] = None
-    n_quantiles: int = 5
+    n_quantiles: int = 20
     commission_rate: float = 0.0003
     min_sample_size: int = 30
     
@@ -131,15 +131,12 @@ class FactorsTester:
                 warnings.warn(f"Error processing contract {contract}: {str(e)}")
                 return pd.DataFrame()
         
-        # 并行处理
         results = Parallel(n_jobs=n_jobs, batch_size=batch_size)(
             delayed(process_single_contract)(contract) for contract in contracts
         )
         
-        # 合并结果
         final_df = pd.concat(results, ignore_index=True)
         
-        # 保存结果
         if not final_df.empty:
             save_time = datetime.now().strftime('%Y%m%d_%H%M%S')
             for factor in factor_names:
@@ -184,7 +181,7 @@ class FactorsTester:
     @staticmethod
     def calculate_forward_returns(df: pd.DataFrame, 
                                 periods: List[int],
-                                price_col: str = 'LastPrice',
+                                price_col: str = 'mid_price',  # 修改默认使用中间价
                                 time_col: str = None) -> pd.DataFrame:
         """
         计算未来收益率
@@ -202,12 +199,10 @@ class FactorsTester:
         
         for period in periods:
             if time_col is not None:
-                # 基于时间的收益率计算
                 result[f'{period}period_return'] = result.groupby('InstruID').apply(
                     lambda x: x[price_col].shift(-period) / x[price_col] - 1
                 ).reset_index(level=0, drop=True)
             else:
-                # 基于行数的收益率计算
                 result[f'{period}period_return'] = result.groupby('InstruID')[price_col].transform(
                     lambda x: x.shift(-period) / x - 1
                 )
@@ -264,7 +259,6 @@ class FactorsTester:
                     factor_values = valid_data[factor]
                     factor_std = (factor_values - factor_values.mean()) / factor_values.std()
                     
-                    # 去除极端值 (3个标准差)
                     mask = np.abs(factor_std) <= 3
                     factor_std = factor_std[mask]
                     returns = valid_data[return_col][mask]
@@ -272,7 +266,6 @@ class FactorsTester:
                     if len(factor_std) < min_sample:
                         continue
                     
-                    # 计算IC
                     if method == 'pearson':
                         ic = factor_std.corr(returns)
                     else:  # 'spearman'
@@ -281,7 +274,6 @@ class FactorsTester:
                     if not np.isnan(ic):
                         daily_ics.append(ic)
                 
-                # 计算该周期的IC均值
                 if daily_ics:
                     ic_values.append(np.nanmean(daily_ics))
                 else:
@@ -318,7 +310,6 @@ class FactorsTester:
         if isinstance(factor_names, str):
             factor_names = [factor_names]
             
-        # 按日期分组计算IC
         ic_series_dict = {}
         
         for factor in factor_names:
@@ -336,15 +327,12 @@ class FactorsTester:
                         ic_values.append(np.nan)
                         continue
                     
-                    # 去除缺失值
                     valid_data = daily_data[[factor, return_col]].dropna()
                     
-                    # 检查样本量
                     if len(valid_data) < min_sample:
                         ic_values.append(np.nan)
                         continue
                     
-                    # 计算IC
                     if method == 'pearson':
                         ic = valid_data[factor].corr(valid_data[return_col])
                     else:  # 'spearman'
@@ -354,7 +342,6 @@ class FactorsTester:
                 
                 ic_series_list.append(ic_values)
             
-            # 创建该因子的IC时间序列DataFrame
             ic_df = pd.DataFrame(ic_series_list,
                                index=dates,
                                columns=[f'{p}period_ic' for p in return_periods])
@@ -382,7 +369,6 @@ class FactorsTester:
             for column in ic_df.columns:
                 ic_series = ic_df[column].dropna()
                 
-                # 计算统计量
                 stats = {
                     'mean': ic_series.mean(),
                     'std': ic_series.std(),
@@ -396,7 +382,6 @@ class FactorsTester:
                 
                 factor_stats.append(pd.Series(stats))
             
-            # 创建该因子的统计特征DataFrame
             stats_df = pd.concat(factor_stats, axis=1)
             stats_df.columns = ic_df.columns
             stats_df.index = ['IC Mean', 'IC Std', 'T-Stat', 'Skewness', 
@@ -404,7 +389,6 @@ class FactorsTester:
             
             stats_list.append(stats_df)
         
-        # 合并所有因子的统计特征
         result = pd.concat(stats_list, keys=ic_series_dict.keys(), axis=1)
         
         return result
@@ -438,7 +422,6 @@ class FactorsTester:
             if periods is None:
                 periods = [int(col.split('period')[0]) for col in ic_df.columns]
             
-            # 创建子图
             fig, axes = plt.subplots(len(periods), 1, figsize=(15, 5*len(periods)))
             if len(periods) == 1:
                 axes = [axes]
@@ -449,7 +432,6 @@ class FactorsTester:
                     warnings.warn(f"Period {period} not found for factor {factor}")
                     continue
                     
-                # 绘制IC时间序列
                 ax.plot(ic_df.index, ic_df[col], label=f'{period}-Period IC')
                 ax.axhline(y=0, color='r', linestyle='--', alpha=0.3)
                 ax.fill_between(ic_df.index, 0, ic_df[col], 
@@ -457,13 +439,10 @@ class FactorsTester:
                 ax.fill_between(ic_df.index, 0, ic_df[col], 
                               alpha=0.3, where=ic_df[col]<0, color='r')
                 
-                # 设置标题和标签
                 ax.set_title(f'{factor} {period}-Period IC Time Series')
                 ax.set_xlabel('Date')
                 ax.set_ylabel('IC Value')
                 ax.legend()
-                
-                # 添加网格
                 ax.grid(True, alpha=0.3)
             
             plt.tight_layout()
@@ -574,25 +553,25 @@ class FactorsTester:
     @staticmethod
     def quantile_backtest(df: pd.DataFrame,
                          factor_name: str,
-                         n_quantiles: int = 5,
+                         n_quantiles: int = 20,  # 改为20分位
                          return_periods: List[int] = [1, 5, 10, 20],
-                         price_col: str = 'LastPrice',
-                         commission_rate: float = 0.0003) -> Dict[str, pd.DataFrame]:
+                         price_col: str = 'mid_price',  # 使用中间价
+                         commission_rate: float = 0) -> Dict[str, pd.DataFrame]:
         """
         分位数因子开仓回测
         
         Args:
             df: 输入数据
             factor_name: 因子名称
-            n_quantiles: 分位数数量
+            n_quantiles: 分位数数量，默认20分位
             return_periods: 收益率周期列表
-            price_col: 价格列名
+            price_col: 价格列名，默认使用中间价
             commission_rate: 手续费率
             
         Returns:
             包含回测结果的字典，包括:
             - quantile_returns: 各分位数的收益率序列
-            - long_short_returns: 多空组合的收益率序列
+            - long_short_returns: 多空组合的收益率序列（第一分位和第二分位的差值）
             - performance_metrics: 绩效指标
         """
         results = {}
@@ -648,11 +627,12 @@ class FactorsTester:
                 period_returns = period_returns.unstack()
                 if not period_returns.empty:
                     quantile_returns[period] = period_returns
-                    highest_quantile = period_returns.columns.max()
-                    lowest_quantile = period_returns.columns.min()
+                    # 修改多空组合构建方式：第一分位和第二分位的差值
+                    first_quantile = period_returns[0]  # 第一分位
+                    second_quantile = period_returns[1]  # 第二分位
                     
-                    if highest_quantile is not None and lowest_quantile is not None:
-                        long_short = period_returns[highest_quantile] - period_returns[lowest_quantile]
+                    if first_quantile is not None and second_quantile is not None:
+                        long_short = first_quantile - second_quantile
                         long_short = long_short - 2 * commission_rate
                         long_short_returns[period] = long_short
                     else:

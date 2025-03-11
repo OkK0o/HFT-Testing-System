@@ -193,14 +193,20 @@ class FinDataProcessor:
         if 'mid_price' in features:
             # 处理涨跌停情况下的中间价计算
             df['mid_price'] = np.where(
-                (df['AskPrice1'] == 0) & (df['BidPrice1'] != 0),  # 涨停情况
-                df['BidPrice1'],
+                (df['AskPrice1'] == 0) & (df['BidPrice1'] == 0),  # 两边都是0
+                np.nan,  # 先设置为 NaN，后面用 ffill 填充
                 np.where(
-                    (df['BidPrice1'] == 0) & (df['AskPrice1'] != 0),  # 跌停情况
-                    df['AskPrice1'],
-                    (df['AskPrice1'] + df['BidPrice1']) / 2  # 正常情况
+                    (df['AskPrice1'] == 0) & (df['BidPrice1'] != 0),  # 只有卖价为0
+                    df['BidPrice1'],
+                    np.where(
+                        (df['BidPrice1'] == 0) & (df['AskPrice1'] != 0),  # 只有买价为0
+                        df['AskPrice1'],
+                        (df['AskPrice1'] + df['BidPrice1']) / 2  # 正常情况取均值
+                    )
                 )
             )
+            # 按合约分组，用前值填充两边都是0的情况
+            df['mid_price'] = df.groupby('InstruID')['mid_price'].fillna(method='ffill')
         
         for feature in features:
             if feature == 'returns':

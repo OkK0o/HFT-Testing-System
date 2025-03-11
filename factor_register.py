@@ -34,7 +34,10 @@ class FactorRegister:
             )
             def calculate_momentum(df: pd.DataFrame, w=window) -> pd.DataFrame:
                 result = df.copy()
-                result[f'momentum_{w}'] = result.groupby('InstruID')['LastPrice'].transform(
+                # 确保有mid_price列
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                result[f'momentum_{w}'] = result.groupby('InstruID')['mid_price'].transform(
                     lambda x: x.pct_change(w)
                 )
                 return result
@@ -48,7 +51,10 @@ class FactorRegister:
             )
             def calculate_weighted_momentum(df: pd.DataFrame, w=window) -> pd.DataFrame:
                 result = df.copy()
-                price_change = result.groupby('InstruID')['LastPrice'].transform(
+                # 确保有mid_price列
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                price_change = result.groupby('InstruID')['mid_price'].transform(
                     lambda x: x.pct_change(w)
                 )
                 volume_weight = result.groupby('InstruID')['Volume'].transform(
@@ -68,7 +74,10 @@ class FactorRegister:
             )
             def calculate_momentum(df: pd.DataFrame, w=window) -> pd.DataFrame:
                 result = df.copy()
-                result[f'momentum_{w}'] = result.groupby('InstruID')['LastPrice'].transform(
+                # 确保有mid_price列
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                result[f'momentum_{w}'] = result.groupby('InstruID')['mid_price'].transform(
                     lambda x: x.pct_change(w)
                 )
                 return result
@@ -88,7 +97,10 @@ class FactorRegister:
             )
             def calculate_realized_vol(df: pd.DataFrame, w=window) -> pd.DataFrame:
                 result = df.copy()
-                returns = result.groupby('InstruID')['LastPrice'].transform(
+                # 确保有mid_price列
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                returns = result.groupby('InstruID')['mid_price'].transform(
                     lambda x: x.pct_change()
                 )
                 result[f'realized_vol_{w}'] = result.groupby('InstruID')[returns.name].transform(
@@ -122,7 +134,7 @@ class FactorRegister:
             )
             def calculate_volatility(df: pd.DataFrame, w=window) -> pd.DataFrame:
                 result = df.copy()
-                result['log_returns'] = result.groupby('InstruID')['LastPrice'].transform(
+                result['log_returns'] = result.groupby('InstruID')['mid_price'].transform(
                     lambda x: np.log(x / x.shift(1))
                 )
                 result[f'volatility_{w}'] = result.groupby('InstruID')['log_returns'].transform(
@@ -206,7 +218,7 @@ class FactorRegister:
         def calculate_effective_spread(df: pd.DataFrame) -> pd.DataFrame:
             result = df.copy()
             mid_price = (result['AskPrice1'] + result['BidPrice1']) / 2
-            result['effective_spread'] = 2 * abs(result['LastPrice'] - mid_price) / mid_price
+            result['effective_spread'] = 2 * abs(result['mid_price'] - mid_price) / mid_price
             return result
         
         @FactorManager.registry.register(
@@ -217,8 +229,8 @@ class FactorRegister:
         )
         def calculate_amihud(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            returns = result.groupby('InstruID')['LastPrice'].transform(lambda x: abs(x.pct_change()))
-            volume = result.groupby('InstruID')['Volume'].transform(lambda x: x * result['LastPrice'])
+            returns = result.groupby('InstruID')['mid_price'].transform(lambda x: abs(x.pct_change()))
+            volume = result.groupby('InstruID')['Volume'].transform(lambda x: x * result['mid_price'])
             result['amihud_illiquidity'] = returns / (volume + 1e-9)
             result['amihud_illiquidity'] = result.groupby('InstruID')['amihud_illiquidity'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).mean()
@@ -234,8 +246,8 @@ class FactorRegister:
         def calculate_toxicity(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
             result['trade_direction'] = 0
-            result.loc[result['LastPrice'] >= result['AskPrice1'], 'trade_direction'] = 1
-            result.loc[result['LastPrice'] <= result['BidPrice1'], 'trade_direction'] = -1
+            result.loc[result['mid_price'] >= result['AskPrice1'], 'trade_direction'] = 1
+            result.loc[result['mid_price'] <= result['BidPrice1'], 'trade_direction'] = -1
             
             result['signed_volume'] = result['Volume'] * result['trade_direction']
             result['order_flow_toxicity'] = result.groupby('InstruID')['signed_volume'].transform(
@@ -253,7 +265,7 @@ class FactorRegister:
         )
         def calculate_vsp(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            returns = result.groupby('InstruID')['LastPrice'].transform(lambda x: x.pct_change())
+            returns = result.groupby('InstruID')['mid_price'].transform(lambda x: x.pct_change())
             volume_change = result.groupby('InstruID')['Volume'].transform(lambda x: x.pct_change())
             
             result['volume_synchronized_probability'] = ((returns > 0) == (volume_change > 0)).astype(float)
@@ -287,7 +299,7 @@ class FactorRegister:
         )
         def calculate_price_impact(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            price_change = result.groupby('InstruID')['LastPrice'].transform(lambda x: abs(x.pct_change()))
+            price_change = result.groupby('InstruID')['mid_price'].transform(lambda x: abs(x.pct_change()))
             norm_volume = result.groupby('InstruID')['Volume'].transform(
                 lambda x: x / x.rolling(window=window, min_periods=window//2).std()
             )
@@ -305,7 +317,7 @@ class FactorRegister:
         )
         def calculate_quote_slope(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
             result = df.copy()
-            quote_diff = (result['AskPrice1'] - result['BidPrice1']) / result['LastPrice']
+            quote_diff = (result['AskPrice1'] - result['BidPrice1']) / result['mid_price']
             volume_sum = result['AskVolume1'] + result['BidVolume1']
             result['quote_slope'] = quote_diff / (volume_sum + 1e-9)
             result['quote_slope'] = result.groupby('InstruID')['quote_slope'].transform(
@@ -321,7 +333,7 @@ class FactorRegister:
         )
         def calculate_price_reversal(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
             result = df.copy()
-            result['short_return'] = result.groupby('InstruID')['LastPrice'].transform(
+            result['short_return'] = result.groupby('InstruID')['mid_price'].transform(
                 lambda x: x.pct_change(1)
             )
             result['price_reversal'] = -1 * result.groupby('InstruID')['short_return'].transform(
@@ -345,7 +357,7 @@ class FactorRegister:
         def calculate_hft_trend(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
             
-            price_direction = result.groupby('InstruID')['LastPrice'].transform(
+            price_direction = result.groupby('InstruID')['mid_price'].transform(
                 lambda x: np.sign(x - x.shift(1))
             )
             
@@ -402,7 +414,7 @@ class FactorRegister:
         def calculate_intraday_seasonality(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
             result['minute'] = pd.to_datetime(result['UpdateTime']).dt.minute
-            result['price_change'] = result.groupby('InstruID')['LastPrice'].transform(
+            result['price_change'] = result.groupby('InstruID')['mid_price'].transform(
                 lambda x: x.pct_change()
             )
             result['intraday_seasonality'] = result.groupby(['InstruID', 'minute'])['price_change'].transform(
@@ -422,7 +434,7 @@ class FactorRegister:
         )
         def calculate_term_premium(df: pd.DataFrame) -> pd.DataFrame:
             result = df.copy()
-            result['term_premium'] = result['LastPrice'] * (252 / (result['days_to_expiry'] + 1))
+            result['term_premium'] = result['mid_price'] * (252 / (result['days_to_expiry'] + 1))
             return result
 
     @staticmethod
@@ -436,7 +448,7 @@ class FactorRegister:
         )
         def calculate_volume_price_trend(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
             result = df.copy()
-            result['price_trend'] = result.groupby('InstruID')['LastPrice'].transform(
+            result['price_trend'] = result.groupby('InstruID')['mid_price'].transform(
                 lambda x: x.pct_change(window)
             )
             result['rel_volume'] = result.groupby('InstruID')['Volume'].transform(
@@ -454,7 +466,7 @@ class FactorRegister:
         )
         def calculate_liquidity_adjusted_momentum(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
             result = df.copy()
-            result['momentum'] = result.groupby('InstruID')['LastPrice'].transform(
+            result['momentum'] = result.groupby('InstruID')['mid_price'].transform(
                 lambda x: x.pct_change(window)
             )
             result['liquidity_score'] = 1 / (result['spread'] * (1 + abs(result['depth_imbalance'])))
