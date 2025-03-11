@@ -244,49 +244,29 @@ class FactorsTester:
                     ic_values.append(np.nan)
                     continue
                 
-                # 按日期分组计算IC
-                daily_ics = []
-                for date in df['TradDay'].unique():
-                    daily_data = df[df['TradDay'] == date].copy()
-                    
-                    # 去除缺失值
-                    valid_data = daily_data[[factor, return_col]].dropna()
-                    
-                    if len(valid_data) < min_sample:
-                        continue
-                    
-                    # 因子标准化和去极值
-                    factor_values = valid_data[factor]
-                    factor_std = (factor_values - factor_values.mean()) / factor_values.std()
-                    
-                    mask = np.abs(factor_std) <= 3
-                    factor_std = factor_std[mask]
-                    returns = valid_data[return_col][mask]
-                    
-                    if len(factor_std) < min_sample:
-                        continue
-                    
-                    if method == 'pearson':
-                        ic = factor_std.corr(returns)
-                    else:  # 'spearman'
-                        ic = stats.spearmanr(factor_std, returns)[0]
-                    
-                    if not np.isnan(ic):
-                        daily_ics.append(ic)
+                # 直接在时间序列上计算IC
+                valid_data = df[[factor, return_col]].dropna()
                 
-                if daily_ics:
-                    ic_values.append(np.nanmean(daily_ics))
-                else:
+                if len(valid_data) < min_sample:
                     ic_values.append(np.nan)
+                    continue
+                
+                # 对因子进行标准化处理
+                factor_std = (valid_data[factor] - valid_data[factor].mean()) / valid_data[factor].std()
+                
+                # 计算IC
+                if method == 'pearson':
+                    ic = factor_std.corr(valid_data[return_col])
+                else:  # 'spearman'
+                    ic = stats.spearmanr(factor_std, valid_data[return_col])[0]
+                
+                ic_values.append(ic)
             
             ic_results.append(ic_values)
         
-        # 创建结果DataFrame
-        ic_df = pd.DataFrame(ic_results,
-                           index=factor_names,
-                           columns=[f'{p}period_ic' for p in return_periods])
-        
-        return ic_df
+        return pd.DataFrame(ic_results, 
+                          index=factor_names,
+                          columns=[f'{p}period_ic' for p in return_periods])
     
     @staticmethod
     def calculate_ic_series(df: pd.DataFrame,

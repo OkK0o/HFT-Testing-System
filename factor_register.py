@@ -244,17 +244,42 @@ class FactorRegister:
             description="订单流毒性指标"
         )
         def calculate_toxicity(df: pd.DataFrame, window: int = 100) -> pd.DataFrame:
-            result = df.copy()
-            result['trade_direction'] = 0
-            result.loc[result['mid_price'] >= result['AskPrice1'], 'trade_direction'] = 1
-            result.loc[result['mid_price'] <= result['BidPrice1'], 'trade_direction'] = -1
+            """
+            计算订单流毒性因子
             
+            Args:
+                df: 输入数据
+                window: 滚动窗口大小
+                
+            Returns:
+                添加了order_flow_toxicity的DataFrame
+            """
+            result = df.copy()
+            
+            # 1. 确保有mid_price
+            if 'mid_price' not in result.columns:
+                result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+            
+            # 2. 判断交易方向
+            result['trade_direction'] = 0
+            result['LastPrice'] = result['LastPrice'].fillna(result['mid_price'])
+            
+            # 主动买入：成交价大于等于卖一价
+            result.loc[result['LastPrice'] >= result['AskPrice1'], 'trade_direction'] = 1
+            # 主动卖出：成交价小于等于买一价
+            result.loc[result['LastPrice'] <= result['BidPrice1'], 'trade_direction'] = -1
+            
+            # 3. 计算带符号的成交量
             result['signed_volume'] = result['Volume'] * result['trade_direction']
-            result['order_flow_toxicity'] = result.groupby('InstruID')['signed_volume'].transform(
-                lambda x: x.rolling(window=window, min_periods=window//2).sum()
-            ) / (result.groupby('InstruID')['Volume'].transform(
-                lambda x: x.rolling(window=window, min_periods=window//2).sum()
-            ) + 1e-9)
+            
+            # 4. 计算毒性指标
+            # 按合约和交易日分组计算
+            result['order_flow_toxicity'] = result.groupby(['InstruID', 'TradDay'])['signed_volume'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).sum()  # 降低min_periods要求
+            ) / (result.groupby(['InstruID', 'TradDay'])['Volume'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).sum()  # 降低min_periods要求
+            ) + 1e-9)  # 避免除零
+            
             return result
 
         @FactorManager.registry.register(
@@ -347,6 +372,67 @@ class FactorRegister:
             category="microstructure",
             description="成交量导向的概率知情交易指标"
         )
+        def calculate_vpin(df: pd.DataFrame, window: int = 50, bucket_size: int = None) -> pd.DataFrame:
+            """
+            计算 VPIN (Volume-Synchronized Probability of Informed Trading) 因子
+            
+            Args:
+                df: 输入数据
+                window: 滚动窗口大小
+                bucket_size: 成交量桶大小，如果为None则自动设置为日均成交量的1/50
+                
+            Returns:
+                添加了vpin的DataFrame
+            """
+            result = df.copy()
+            
+            # 1. 确保有mid_price
+            if 'mid_price' not in result.columns:
+                result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+            
+            # 2. 计算成交量桶大小（如果未指定）
+            if bucket_size is None:
+                bucket_size = int(result.groupby('TradDay')['Volume'].sum().mean() / 50)
+            
+            # 3. 计算买卖方向
+            result['trade_direction'] = 0
+            result['LastPrice'] = result['LastPrice'].fillna(result['mid_price'])
+            result.loc[result['LastPrice'] >= result['AskPrice1'], 'trade_direction'] = 1
+            result.loc[result['LastPrice'] <= result['BidPrice1'], 'trade_direction'] = -1
+            
+            # 4. 计算带符号的成交量
+            result['signed_volume'] = result['Volume'] * result['trade_direction']
+            
+            # 5. 按交易日分组计算VPIN
+            def calculate_daily_vpin(group):
+                # 累计成交量
+                group['cum_volume'] = group['Volume'].cumsum()
+                # 计算桶编号
+                group['bucket'] = (group['cum_volume'] / bucket_size).astype(int)
+                # 计算每个桶的买卖成交量
+                bucket_volumes = group.groupby('bucket').agg({
+                    'signed_volume': 'sum',
+                    'Volume': 'sum'
+                })
+                # 计算每个桶的买卖失衡比例
+                bucket_volumes['vpin'] = abs(bucket_volumes['signed_volume']) / bucket_volumes['Volume']
+                # 使用滚动窗口计算VPIN
+                bucket_volumes['vpin'] = bucket_volumes['vpin'].rolling(
+                    window=window, 
+                    min_periods=1
+                ).mean()
+                # 将VPIN值映射回原始数据
+                return group['bucket'].map(bucket_volumes['vpin'])
+            
+            # 按合约和交易日分组计算VPIN
+            result['vpin'] = result.groupby(['InstruID', 'TradDay']).apply(
+                calculate_daily_vpin
+            ).reset_index(level=[0,1], drop=True)
+            
+            # 6. 填充缺失值
+            result['vpin'] = result.groupby('InstruID')['vpin'].fillna(method='ffill')
+            
+            return result
 
         @FactorManager.registry.register(
             name="hft_trend",
@@ -369,8 +455,7 @@ class FactorRegister:
             result['hft_trend'] = result.groupby('InstruID')['signal'].transform(
                 lambda x: x.rolling(window=window, min_periods=window//2).apply(
                     lambda y: np.sum(y * np.exp(-np.arange(len(y))[::-1]/window))
-                )
-            )
+                ))
             
             result.drop('signal', axis=1, inplace=True)
             
