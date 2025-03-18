@@ -53,7 +53,8 @@ class FactorsTester:
                            factor_names: List[str],
                            n_jobs: int = 10,
                            method: str = 'spearman',
-                           return_periods: List[int] = [1, 5, 10, 20]) -> pd.DataFrame:
+                           return_periods: List[int] = [1, 5, 10, 20],
+                           generate_images: bool = False) -> pd.DataFrame:
         """
         并行计算多个合约的因子测试结果
         
@@ -63,6 +64,7 @@ class FactorsTester:
             n_jobs: 并行进程数
             method: IC计算方法，'pearson'或'spearman'
             return_periods: 收益率周期列表
+            generate_images: 是否生成图片
             
         Returns:
             因子测试结果DataFrame
@@ -111,6 +113,11 @@ class FactorsTester:
                             else:  # 'spearman'
                                 ic = stats.spearmanr(factor_std, valid_data[return_col])[0]
                             
+                            # 调整因子值符号
+                            if ic < 0:
+                                valid_data[factor] = -valid_data[factor]
+                                ic = -ic
+                            
                             ic_values.append(ic)
                             
                         result_dict = {
@@ -144,9 +151,21 @@ class FactorsTester:
                 if not factor_df.empty:
                     filename = f"{factor}_{method}_ic_{save_time}.csv"
                     factor_df.to_csv(os.path.join(self.save_path, filename), index=False)
+                    
+                    # 生成图片
+                    if generate_images:
+                        self.plot_ic_series({factor: factor_df}, factor_names=factor, periods=return_periods)
         
         end_time = time.time()
         print(f'因子测试完成，用时: {end_time - start_time:.2f}s')
+        
+        # 输出汇总表格
+        summary = final_df.groupby('factor').agg({
+            f'ic_{period}': ['mean', 'std'] for period in return_periods
+        })
+        summary.columns = ['_'.join(col).strip() for col in summary.columns.values]
+        print("\n因子测试汇总:")
+        print(summary)
         
         return final_df
     
@@ -694,7 +713,8 @@ class FactorsTester:
     def test_single_factor(self, 
                           factor_name: str, 
                           data: pd.DataFrame,
-                          config: Optional[FactorTestConfig] = None) -> Dict:
+                          config: Optional[FactorTestConfig] = None,
+                          generate_images: bool = True) -> Dict:
         """
         单因子测试接口
         
@@ -702,6 +722,7 @@ class FactorsTester:
             factor_name: 因子名称
             data: 包含因子值的DataFrame
             config: 测试配置，如果为None则使用默认配置
+            generate_images: 是否生成图片
             
         Returns:
             包含测试结果的字典
@@ -747,15 +768,17 @@ class FactorsTester:
         
         self._print_evaluation(results)
         
-        max_period = max(config.return_periods)
-        if max_period in quantile_results.get('quantile_returns', {}):
-            self.plot_quantile_results(
-                results=quantile_results,
-                period=max_period,
-                factor_name=factor_name
-            )
-        else:
-            print(f"\n警告：无法绘制分位数回测结果，周期 {max_period} 的回测结果不完整")
+        # 只在generate_images为True时生成图片
+        if generate_images:
+            max_period = max(config.return_periods)
+            if max_period in quantile_results.get('quantile_returns', {}):
+                self.plot_quantile_results(
+                    results=quantile_results,
+                    period=max_period,
+                    factor_name=factor_name
+                )
+            else:
+                print(f"\n警告：无法绘制分位数回测结果，周期 {max_period} 的回测结果不完整")
         
         return results
     
