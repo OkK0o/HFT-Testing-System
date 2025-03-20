@@ -37,7 +37,7 @@ def calculate_ic(predictions, returns):
     
     # 计算Spearman相关系数
     try:
-        ic = spearmanr(predictions, returns)[0]
+        ic = stats.spearmanr(predictions, returns)[0]
         if np.isnan(ic):
             print("警告: 计算的IC为NaN")
         return ic
@@ -166,6 +166,9 @@ def train_xgboost_with_bayesian(df,
     # 滚动窗口训练
     window_size = train_days + val_days + test_days
     
+    # 初始化特征重要性收集列表
+    feature_importances = []
+    
     for start_idx in range(0, len(unique_days) - window_size + 1):
         window_days = unique_days[start_idx:start_idx + window_size]
         train_window = window_days[:train_days]
@@ -181,7 +184,7 @@ def train_xgboost_with_bayesian(df,
         train_mask = date.isin(train_window)
         val_mask = date.isin(val_window)
         test_mask = date.isin(test_window)
-        
+    
         X_train, y_train = X[train_mask], y[train_mask]
         X_val, y_val = X[val_mask], y[val_mask]
         X_test, y_test = X[test_mask], y[test_mask]
@@ -295,13 +298,13 @@ def train_xgboost_with_bayesian(df,
                     for i, feature in enumerate(features_to_plot):
                         plt.subplot(n_features_to_plot, 2, i*2+1)
                         sns.histplot(X_train[feature], kde=True, bins=30)
-                        plt.title(f"{feature} - 标准化前")
-                        plt.xlabel("值")
+                        plt.title(f"{feature} - Before Standardization")
+                        plt.xlabel("Value")
                         
                         plt.subplot(n_features_to_plot, 2, i*2+2)
                         sns.histplot(X_train_scaled[feature], kde=True, bins=30)
-                        plt.title(f"{feature} - 标准化后")
-                        plt.xlabel("值")
+                        plt.title(f"{feature} - After Standardization")
+                        plt.xlabel("Value")
                     
                     plt.tight_layout()
                     plt.savefig(f"{window_model_dir}/feature_distribution_comparison.png", dpi=100)
@@ -434,7 +437,7 @@ def train_xgboost_with_bayesian(df,
             if n_bayesian_iter < 7:
                 print(f"警告: n_bayesian_iter={n_bayesian_iter} 小于最小需求(7)，使用默认参数")
                 raise ValueError(f"Expected `n_calls` >= 7, got {n_bayesian_iter}")
-                
+    
             # 运行贝叶斯优化
             result = gp_minimize(
                 objective,
@@ -475,7 +478,7 @@ def train_xgboost_with_bayesian(df,
                 'lambda': 1,
                 'n_estimators': 200
             }
-        
+    
         # 使用最佳参数训练最终模型
         print("使用最佳参数训练最终模型...")
         
@@ -531,7 +534,7 @@ def train_xgboost_with_bayesian(df,
         # 存储测试集预测
         test_indices = df.index[test_mask]
         all_predictions.loc[test_indices] = test_pred
-        
+    
         # 计算评估指标
         # 检查是否有足够的数据计算指标
         if len(y_test_original) > 0 and not np.all(np.isnan(y_test_original)) and not np.all(np.isnan(test_pred)):
@@ -600,11 +603,11 @@ def train_xgboost_with_bayesian(df,
             'test_end': max(test_window),
             'train_samples': len(X_train),
             'test_samples': len(X_test),
-            'mse': test_mse,
-            'mae': test_mae,
-            'r2': test_r2,
-            'ic': test_ic,
-            'direction_accuracy': test_direction_accuracy,
+        'mse': test_mse,
+        'mae': test_mae,
+        'r2': test_r2,
+        'ic': test_ic,
+        'direction_accuracy': test_direction_accuracy,
             'profit_loss_ratio': test_profit_loss_ratio,
             'avg_return_correct_sign': avg_return_correct
         }
@@ -635,6 +638,17 @@ def train_xgboost_with_bayesian(df,
         del best_model
         import gc
         gc.collect()  # 强制垃圾回收
+        
+        # 从每个窗口结果中提取特征重要性信息
+        for feature, importance in window_results[-1]['feature_importance'].items():
+            feature_importances.append({
+                'feature': feature,
+                'importance': importance,
+                'window': window_results[-1]['window']
+            })
+    
+    # 创建整体结果汇总前，检查特征重要性数据
+    print(f"收集了 {len(feature_importances)} 条特征重要性记录，来自 {len(window_results)} 个窗口")
     
     # 没有成功训练任何窗口
     if not all_metrics:
@@ -654,6 +668,9 @@ def train_xgboost_with_bayesian(df,
     overall_r2 = r2_score(valid_returns, all_predictions[valid_mask])
     overall_ic = calculate_ic(all_predictions[valid_mask], valid_returns)
     overall_direction_accuracy = np.mean(np.sign(valid_returns) == np.sign(all_predictions[valid_mask]))
+    
+    # 将valid_mask转换为numpy数组，用于后续处理
+    valid_mask_array = np.array(valid_mask)
     
     # 计算夏普比率
     pred_sign = np.sign(all_predictions[valid_mask])
@@ -712,30 +729,28 @@ def train_xgboost_with_bayesian(df,
     pd.Series(overall_metrics).to_csv(f"{output_dir}/overall_metrics_summary.csv")
     
     # 创建详细的窗口指标表格
-    detailed_window_metrics = metrics_df.copy()
+    detailed_metrics_df = metrics_df.copy()
     
     # 添加窗口特定信息
     for i, result in enumerate(window_results):
-        if i < len(detailed_window_metrics):
+        if i < len(detailed_metrics_df):
             # 添加使用的特征数量
-            detailed_window_metrics.loc[i, 'num_features_used'] = len(result['features_used'])
+            detailed_metrics_df.loc[i, 'num_features_used'] = len(result['features_used'])
             
             # 添加模型参数
             for param, value in result['best_params'].items():
-                detailed_window_metrics.loc[i, f'param_{param}'] = value
+                detailed_metrics_df.loc[i, f'param_{param}'] = value
             
-            # 添加迭代次数
-            if hasattr(result['model'], 'best_iteration'):
-                detailed_window_metrics.loc[i, 'best_iteration'] = result['model'].best_iteration
-    
+            # 添加迭代次数不再从模型对象中获取，因为模型对象已被释放以节省内存
+        
     # 保存详细窗口指标
-    detailed_window_metrics.to_csv(f"{output_dir}/detailed_window_metrics.csv", index=False)
+    detailed_metrics_df.to_csv(f"{output_dir}/detailed_window_metrics.csv", index=False)
     
     # 分析参数和性能指标的相关性
     try:
-        if len(detailed_window_metrics) > 10:  # 确保有足够的数据进行分析
+        if len(detailed_metrics_df) > 10:  # 确保有足够的数据进行分析
             # 提取参数列（以'param_'开头的列）
-            param_cols = [col for col in detailed_window_metrics.columns if col.startswith('param_')]
+            param_cols = [col for col in detailed_metrics_df.columns if col.startswith('param_')]
             
             if param_cols:  # 确保有参数列
                 # 性能指标列
@@ -745,16 +760,16 @@ def train_xgboost_with_bayesian(df,
                 corr_results = []
                 
                 # 批量计算Spearman相关系数，减少内存使用
-                batch_size = min(50, len(detailed_window_metrics))
+                batch_size = min(50, len(detailed_metrics_df))
                 for param_col in param_cols:
                     for metric_col in metric_cols:
                         # 检查参数列是否包含足够的不同值
-                        unique_vals = detailed_window_metrics[param_col].nunique()
+                        unique_vals = detailed_metrics_df[param_col].nunique()
                         if unique_vals <= 1:  # 跳过只有一个值的参数
                             continue
                             
                         # 确保两列都有有效数值
-                        valid_data = detailed_window_metrics[[param_col, metric_col]].dropna()
+                        valid_data = detailed_metrics_df[[param_col, metric_col]].dropna()
                         if len(valid_data) < 10:  # 至少需要10个有效样本
                             continue
                             
@@ -767,8 +782,8 @@ def train_xgboost_with_bayesian(df,
                                 
                             # 计算Spearman相关系数
                             corr, p_value = stats.spearmanr(
-                                sample_data[param_col], 
-                                sample_data[metric_col],
+                                sample_data[param_col].values, 
+                                sample_data[metric_col].values,
                                 nan_policy='omit'
                             )
                             
@@ -815,9 +830,9 @@ def train_xgboost_with_bayesian(df,
                                     center=0,
                                     linewidths=0.5,
                                     fmt='.2f',
-                                    cbar_kws={'label': 'Spearman相关系数'}
+                                    cbar_kws={'label': 'Spearman Correlation Coefficient'}
                                 )
-                                plt.title('参数与性能指标的显著相关性')
+                                plt.title('Significant Correlation between Parameters and Performance')
                                 plt.tight_layout()
                                 plt.savefig(f"{output_dir}/param_performance_heatmap.png", dpi=100)
                                 plt.close()
@@ -833,27 +848,27 @@ def train_xgboost_with_bayesian(df,
     
     # 创建分类表格 - 按性能分组分析窗口
     try:
-        if len(detailed_window_metrics) >= 15:  # 确保有足够的窗口进行分组分析
+        if len(detailed_metrics_df) >= 15:  # 确保有足够的窗口进行分组分析
             print("创建窗口性能分组分析...")
             
             # 使用IC值对窗口进行分组
-            detailed_window_metrics['IC_Group'] = pd.qcut(
-                detailed_window_metrics['ic'], 
+            detailed_metrics_df['IC_Group'] = pd.qcut(
+                detailed_metrics_df['ic'], 
                 q=3, 
-                labels=['低IC', '中IC', '高IC'],
+                labels=['Low IC', 'Medium IC', 'High IC'],
                 duplicates='drop'  # 处理重复边界值
             )
             
             # 如果分组失败(例如，太多重复值)，使用自定义分组
-            if 'IC_Group' not in detailed_window_metrics.columns or detailed_window_metrics['IC_Group'].isna().all():
-                ic_median = detailed_window_metrics['ic'].median()
-                detailed_window_metrics['IC_Group'] = detailed_window_metrics['ic'].apply(
-                    lambda x: '高IC' if x > ic_median * 1.2 else ('低IC' if x < ic_median * 0.8 else '中IC')
+            if 'IC_Group' not in detailed_metrics_df.columns or detailed_metrics_df['IC_Group'].isna().all():
+                ic_median = detailed_metrics_df['ic'].median()
+                detailed_metrics_df['IC_Group'] = detailed_metrics_df['ic'].apply(
+                    lambda x: 'High IC' if x > ic_median * 1.2 else ('Low IC' if x < ic_median * 0.8 else 'Medium IC')
                 )
             
             # 对每个组计算平均指标
             group_stats = []
-            for group_name, group_data in detailed_window_metrics.groupby('IC_Group'):
+            for group_name, group_data in detailed_metrics_df.groupby('IC_Group'):
                 if len(group_data) < 3:  # 跳过样本过少的组
                     continue
                     
@@ -913,8 +928,12 @@ def train_xgboost_with_bayesian(df,
     
     # 添加预测与实际值相关性分析
     print(f"预测与实际值相关性:")
-    print(f"  - 皮尔逊相关系数: {stats.pearsonr(all_predictions[valid_mask], valid_returns)[0]:.6f}")
-    print(f"  - 斯皮尔曼相关系数: {spearmanr(all_predictions[valid_mask], valid_returns)[0]:.6f}")
+    try:
+        print(f"  - 皮尔逊相关系数: {stats.pearsonr(all_predictions[valid_mask].values, valid_returns.values)[0]:.6f}")
+        print(f"  - 斯皮尔曼相关系数: {stats.spearmanr(all_predictions[valid_mask].values, valid_returns.values)[0]:.6f}")
+    except Exception as e:
+        print(f"  - 计算相关系数时出错: {str(e)}")
+        traceback.print_exc()
     
     # 计算并可视化平均特征重要性
     try:
@@ -969,8 +988,8 @@ def train_xgboost_with_bayesian(df,
                         fontsize=8
                     )
                 
-                plt.xlabel('平均重要性', fontsize=10)
-                plt.title('顶部特征重要性及使用频率', fontsize=12)
+                plt.xlabel('Average Importance', fontsize=10)
+                plt.title('Top Feature Importance and Usage Frequency', fontsize=12)
                 plt.grid(axis='x', alpha=0.3)
                 plt.tight_layout()
                 plt.savefig(f"{output_dir}/avg_feature_importance.png", dpi=100)
@@ -984,7 +1003,7 @@ def train_xgboost_with_bayesian(df,
     # 可视化每个窗口的IC值和方向准确率
     try:
         if len(metrics_df) >= 5:  # 确保有足够的窗口数据才生成图表
-            print("生成IC和方向准确率可视化...")
+            print("Generating IC and direction accuracy visualization...")
             
             # 创建单个图表展示IC和方向准确率，减少内存消耗
             plt.figure(figsize=(10, 6))
@@ -993,19 +1012,19 @@ def train_xgboost_with_bayesian(df,
             ax1 = plt.subplot(111)
             ax1.plot(range(len(metrics_df)), metrics_df['ic'], 'o-', color='royalblue', alpha=0.7, label='IC')
             ax1.axhline(y=metrics_df['ic'].mean(), color='royalblue', linestyle='--', 
-                        label=f'平均 IC: {metrics_df["ic"].mean():.4f}')
-            ax1.set_ylabel('信息系数 (IC)', color='royalblue')
+                        label=f'Avg IC: {metrics_df["ic"].mean():.4f}')
+            ax1.set_ylabel('Information Coefficient (IC)', color='royalblue')
             ax1.tick_params(axis='y', labelcolor='royalblue')
             ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
             
             # 创建共享x轴的第二个y轴 - 方向准确率
             ax2 = ax1.twinx()
             ax2.plot(range(len(metrics_df)), metrics_df['direction_accuracy'], 'o-', 
-                     color='darkorange', alpha=0.7, label='方向准确率')
+                     color='darkorange', alpha=0.7, label='Direction Accuracy')
             ax2.axhline(y=metrics_df['direction_accuracy'].mean(), color='darkorange', linestyle='--',
-                        label=f'平均方向准确率: {metrics_df["direction_accuracy"].mean():.4f}')
-            ax2.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, label='随机水平 (0.5)')
-            ax2.set_ylabel('方向准确率', color='darkorange')
+                        label=f'Avg Direction Accuracy: {metrics_df["direction_accuracy"].mean():.4f}')
+            ax2.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, label='Random Level (0.5)')
+            ax2.set_ylabel('Direction Accuracy', color='darkorange')
             ax2.tick_params(axis='y', labelcolor='darkorange')
             
             # 合并图例
@@ -1013,8 +1032,8 @@ def train_xgboost_with_bayesian(df,
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax1.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=9)
             
-            plt.title('各窗口IC值和方向准确率')
-            plt.xlabel('窗口索引')
+            plt.title('IC and Direction Accuracy by Window')
+            plt.xlabel('Window Index')
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.savefig(f"{output_dir}/window_ic_and_direction.png", dpi=100)
@@ -1027,7 +1046,7 @@ def train_xgboost_with_bayesian(df,
     
     # 绘制预测值与实际值的散点图
     try:
-        print("生成预测值与实际值散点图...")
+        print("Generating predicted vs actual values scatter plot...")
         
         # 确保有足够的有效预测数据
         valid_preds_mask = ~np.isnan(all_predictions) & ~np.isinf(all_predictions)
@@ -1074,7 +1093,7 @@ def train_xgboost_with_bayesian(df,
             # 添加对角线（理想情况）
             min_val = min(p_min, r_min)
             max_val = max(p_max, r_max)
-            plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label='理想预测线')
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label='Ideal Prediction Line')
             
             # 绘制散点图
             plt.scatter(plot_predictions, plot_returns, alpha=0.5, s=10, color='darkblue')
@@ -1087,7 +1106,7 @@ def train_xgboost_with_bayesian(df,
                     [p_min, p_max], 
                     [p(p_min), p(p_max)], 
                     'g-', 
-                    label=f'拟合线 (斜率={z[0]:.4f})'
+                    label=f'Fitted Line (Slope={z[0]:.4f})'
                 )
             except Exception as e:
                 print(f"绘制趋势线失败: {str(e)}")
@@ -1096,15 +1115,15 @@ def train_xgboost_with_bayesian(df,
             corr = np.corrcoef(plot_predictions, plot_returns)[0, 1]
             plt.text(
                 0.05, 0.95, 
-                f"相关系数: {corr:.4f}\n点数: {len(plot_predictions)}", 
+                f"Correlation: {corr:.4f}\nPoints: {len(plot_predictions)}", 
                 transform=plt.gca().transAxes, 
                 verticalalignment='top', 
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
             )
             
-            plt.title('预测值 vs 实际收益率')
-            plt.xlabel('预测值')
-            plt.ylabel('实际收益率')
+            plt.title('Predicted vs Actual Returns')
+            plt.xlabel('Predicted Value')
+            plt.ylabel('Actual Return')
             plt.grid(True, alpha=0.3)
             plt.legend()
             plt.tight_layout()
@@ -1121,7 +1140,7 @@ def train_xgboost_with_bayesian(df,
     # 绘制R2和MSE趋势图（可选）
     # 只在窗口数量足够多时生成，避免过多图形
     if len(metrics_df) >= 5:  # 至少有5个窗口才绘制趋势图
-        print("生成R2和MSE趋势图...")
+        print("Generating R² and MSE trend plot...")
         plt.figure(figsize=(10, 6))
         
         ax1 = plt.subplot(111)
@@ -1141,37 +1160,66 @@ def train_xgboost_with_bayesian(df,
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
         
-        plt.title('各窗口R²和MSE趋势')
-        plt.xlabel('窗口索引')
+        plt.title('R² and MSE Trends by Window')
+        plt.xlabel('Window Index')
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(f"{output_dir}/window_r2_and_mse.png", dpi=100)
         plt.close()  # 确保释放内存
     
     # 绘制分位数分析图
-    # 减少数据量，抽样处理
-    if len(pred_df) > 10000:
-        pred_df = pred_df.sample(10000, random_state=42)
-    
-    plt.figure(figsize=(12, 8))
-    
-    # 将预测分成10个分位数
-    pred_df['quantile'] = pd.qcut(pred_df['pred'], 10, labels=False)
-    
-    # 计算每个分位数的平均实际收益率
-    quantile_returns = pred_df.groupby('quantile')['actual'].mean()
-    
-    # 绘制每个分位数的平均收益率
-    plt.bar(range(10), quantile_returns, alpha=0.7)
-    plt.axhline(y=0, color='r', linestyle='--')
-    plt.xticks(range(10), [f'Q{i+1}' for i in range(10)])
-    plt.xlabel('预测值分位数（从低到高）')
-    plt.ylabel('平均实际收益率')
-    plt.title('预测分位数收益分析')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/quantile_returns.png", dpi=150)  # 降低dpi以减少内存使用
-    plt.close()  # 确保释放内存
+    try:
+        print("Generating quantile return analysis plot...")
+        
+        # 创建预测与实际收益的数据框
+        pred_df = pd.DataFrame({
+            'pred': all_predictions[valid_mask],
+            'actual': valid_returns
+        }).dropna()
+        
+        # 检查是否有足够的数据进行分析
+        if len(pred_df) >= 100:
+            # 减少数据量，抽样处理
+            if len(pred_df) > 10000:
+                pred_df = pred_df.sample(10000, random_state=42)
+            
+            plt.figure(figsize=(10, 6))
+            
+            # 将预测分成10个分位数
+            pred_df['quantile'] = pd.qcut(pred_df['pred'], 10, labels=False)
+            
+            # 计算每个分位数的平均实际收益率
+            quantile_returns = pred_df.groupby('quantile')['actual'].mean()
+            quantile_counts = pred_df.groupby('quantile').size()
+            
+            # 绘制每个分位数的平均收益率
+            bars = plt.bar(range(10), quantile_returns, alpha=0.7)
+            
+            # 添加样本数量标签
+            for i, bar in enumerate(bars):
+                plt.text(
+                    i,
+                    bar.get_height() + (0.0001 if bar.get_height() >= 0 else -0.0004),
+                    f"n={quantile_counts.iloc[i]}",
+                    ha='center',
+                    va='bottom' if bar.get_height() >= 0 else 'top',
+                    fontsize=8
+                )
+            
+            plt.axhline(y=0, color='r', linestyle='--')
+            plt.xticks(range(10), [f'Q{i+1}' for i in range(10)])
+            plt.xlabel('Prediction Quantiles (Low to High)')
+            plt.ylabel('Average Actual Return')
+            plt.title('Return Analysis by Prediction Quantile')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/quantile_returns.png", dpi=100)  # 降低dpi以减少内存使用
+            plt.close()  # 确保释放内存
+        else:
+            print("有效数据不足，跳过分位数分析图生成")
+    except Exception as e:
+        print(f"生成预测分位数收益分析图时出错: {str(e)}")
+        traceback.print_exc()
     
     # 保存完整预测结果
     prediction_df = pd.DataFrame({
@@ -1224,7 +1272,6 @@ def train_xgboost_with_bayesian(df,
     }
     
     return results
-
 if __name__ == "__main__":
     # 加载因子调整后的数据
     print("加载数据...")
