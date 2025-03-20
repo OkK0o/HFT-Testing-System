@@ -4,6 +4,7 @@ import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy import stats
+from scipy.stats import spearmanr  # 明确导入spearmanr函数
 import matplotlib.pyplot as plt
 import seaborn as sns
 from skopt import BayesSearchCV
@@ -11,7 +12,8 @@ from skopt.space import Real, Integer
 import os
 import joblib
 from datetime import datetime
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
+import traceback
 
 def calculate_ic(predictions, returns):
     """计算IC值"""
@@ -35,7 +37,7 @@ def calculate_ic(predictions, returns):
     
     # 计算Spearman相关系数
     try:
-        ic = stats.spearmanr(predictions, returns)[0]
+        ic = spearmanr(predictions, returns)[0]
         if np.isnan(ic):
             print("警告: 计算的IC为NaN")
         return ic
@@ -73,7 +75,7 @@ def analyze_signal_distribution(predictions, returns):
     
     # 信号与收益率的联合分布特征
     stats_dict['信号-收益率相关系数'] = stats.pearsonr(predictions, returns)[0]
-    stats_dict['信号-收益率Spearman相关系数'] = stats.spearmanr(predictions, returns)[0]
+    stats_dict['信号-收益率Spearman相关系数'] = spearmanr(predictions, returns)[0]
     
     # 信号分布区间统计
     signal_ranges = np.percentile(predictions, [0, 25, 50, 75, 100])
@@ -199,9 +201,46 @@ def train_xgboost_with_bayesian(df,
         # 特征标准化 - 使用训练集的均值和标准差对所有数据进行标准化
         if standardize:
             print("对特征进行标准化处理...")
-            scaler = StandardScaler()
             
-            # 注意：我们只使用训练集来拟合scaler，然后应用到所有数据集
+            # 金融时序数据的稳健标准化策略
+            # 1. 进行特征稳定性分析
+            print("进行特征稳定性分析...")
+            feature_stability = {}
+            
+            # 如果训练窗口超过1天，分析每个特征在不同日期的变化
+            if len(train_window) > 1:
+                try:
+                    train_daily_stats = df[df['TradDay'].isin(train_window)].groupby('TradDay')[feature_cols].mean()
+                    # 计算变异系数(CV = std/mean) - 较低的CV表示更稳定的特征
+                    feature_cv = {}
+                    for feature in feature_cols:
+                        mean_vals = train_daily_stats[feature]
+                        cv = mean_vals.std() / mean_vals.mean() if mean_vals.mean() != 0 else float('inf')
+                        feature_cv[feature] = abs(cv)  # 使用绝对值
+                    
+                    # 选择最稳定的特征
+                    stable_threshold = np.percentile(list(feature_cv.values()), 75)  # 75%分位数
+                    stable_features = [f for f, cv in feature_cv.items() if cv <= stable_threshold]
+                    print(f"基于日间稳定性分析，选择了{len(stable_features)}/{len(feature_cols)}个相对稳定的特征")
+                    
+                    # 如果稳定特征太少，则使用所有特征
+                    if len(stable_features) < 10:
+                        print("稳定特征太少，使用所有特征")
+                        stable_features = feature_cols
+                except Exception as e:
+                    print(f"特征稳定性分析失败: {e}，使用所有特征")
+                    stable_features = feature_cols
+            else:
+                # 只有一天数据时，无法分析稳定性，使用所有特征
+                stable_features = feature_cols
+                
+            # 2. 应用更稳健的标准化方法
+            from sklearn.preprocessing import RobustScaler  # 稳健标准化，对异常值不敏感
+            
+            # 针对金融数据特点使用RobustScaler而非StandardScaler
+            scaler = RobustScaler(quantile_range=(5, 95))  # 使用5%-95%分位数而非默认的25%-75%
+            
+            # 注意：我们只使用训练集来拟合scaler
             X_train_scaled = pd.DataFrame(
                 scaler.fit_transform(X_train),
                 index=X_train.index,
@@ -221,18 +260,54 @@ def train_xgboost_with_bayesian(df,
                 columns=X_test.columns
             )
             
+            # 3. 处理标准化后的极端值（对测试集尤为重要）
+            clip_threshold = 10.0  # 可调整的阈值
+            for col in X_test_scaled.columns:
+                # 只处理明显异常的值
+                X_test_scaled[col] = X_test_scaled[col].clip(-clip_threshold, clip_threshold)
+            
+            # 根据需要处理验证集
+            for col in X_val_scaled.columns:
+                X_val_scaled[col] = X_val_scaled[col].clip(-clip_threshold, clip_threshold)
+            
             # 输出标准化前后的统计信息用于验证
-            print("标准化前的特征统计 (训练集):")
-            print(f"  均值范围: [{X_train.mean().min():.4f}, {X_train.mean().max():.4f}]")
-            print(f"  标准差范围: [{X_train.std().min():.4f}, {X_train.std().max():.4f}]")
+            print("标准化前后特征分布对比(简化版):")
+            print(f"  训练集 - 标准化前均值范围: [{X_train.mean().min():.4f}, {X_train.mean().max():.4f}]")
+            print(f"  训练集 - 标准化后均值范围: [{X_train_scaled.mean().min():.4f}, {X_train_scaled.mean().max():.4f}]")
+            print(f"  测试集 - 标准化后均值范围: [{X_test_scaled.mean().min():.4f}, {X_test_scaled.mean().max():.4f}]")
+            print(f"  测试集 - 标准化后标准差范围: [{X_test_scaled.std().min():.4f}, {X_test_scaled.std().max():.4f}]")
             
-            print("标准化后的特征统计 (训练集):")  
-            print(f"  均值范围: [{X_train_scaled.mean().min():.4f}, {X_train_scaled.mean().max():.4f}]")
-            print(f"  标准差范围: [{X_train_scaled.std().min():.4f}, {X_train_scaled.std().max():.4f}]")
+            # 保存标准化统计信息（简化版）
+            window_model_dir = f"{output_dir}/window_{start_idx+1}"
+            os.makedirs(window_model_dir, exist_ok=True)
             
-            print("标准化后的特征统计 (测试集):")
-            print(f"  均值范围: [{X_test_scaled.mean().min():.4f}, {X_test_scaled.mean().max():.4f}]")
-            print(f"  标准差范围: [{X_test_scaled.std().min():.4f}, {X_test_scaled.std().max():.4f}]")
+            # 4. 减少图形生成，只在需要时生成
+            # 只在第一个窗口和每10个窗口保存一次分布图
+            if start_idx == 0 or (start_idx + 1) % 10 == 0:
+                try:
+                    # 选择最多3个有代表性的特征
+                    n_features_to_plot = min(3, len(X_train.columns))
+                    # 按方差排序选择最具变化性的特征
+                    features_to_plot = X_train.var().sort_values(ascending=False).index[:n_features_to_plot]
+                    
+                    # 创建标准化前后分布对比图（简化版）
+                    plt.figure(figsize=(12, 4*n_features_to_plot))
+                    for i, feature in enumerate(features_to_plot):
+                        plt.subplot(n_features_to_plot, 2, i*2+1)
+                        sns.histplot(X_train[feature], kde=True, bins=30)
+                        plt.title(f"{feature} - 标准化前")
+                        plt.xlabel("值")
+                        
+                        plt.subplot(n_features_to_plot, 2, i*2+2)
+                        sns.histplot(X_train_scaled[feature], kde=True, bins=30)
+                        plt.title(f"{feature} - 标准化后")
+                        plt.xlabel("值")
+                    
+                    plt.tight_layout()
+                    plt.savefig(f"{window_model_dir}/feature_distribution_comparison.png", dpi=100)
+                    plt.close()  # 关闭图表释放内存
+                except Exception as e:
+                    print(f"绘制特征分布图失败: {e}")
             
             # 将标准化后的数据作为训练数据
             X_train = X_train_scaled
@@ -240,16 +315,12 @@ def train_xgboost_with_bayesian(df,
             X_test = X_test_scaled
             
             # 保存特征均值和标准差，用于后续分析和预测
-            scaler_output = pd.DataFrame({
-                'feature': X_train.columns,
-                'mean': scaler.mean_,
-                'scale': scaler.scale_
-            })
-            
-            # 创建scaler输出目录
-            window_model_dir = f"{output_dir}/window_{start_idx+1}"
-            os.makedirs(window_model_dir, exist_ok=True)
-            scaler_output.to_csv(f"{window_model_dir}/feature_scaler.csv", index=False)
+            # 仅保存必要的统计信息，减少存储
+            scaler_stats = {
+                'center_': scaler.center_,
+                'scale_': scaler.scale_
+            }
+            joblib.dump(scaler_stats, f"{window_model_dir}/feature_scaler.pkl")
         
         # 特征选择 - 在每个窗口上动态选择特征
         from sklearn.feature_selection import SelectFromModel
@@ -359,6 +430,11 @@ def train_xgboost_with_bayesian(df,
         print("开始贝叶斯参数调优...")
         
         try:
+            # 检查n_bayesian_iter是否满足最小要求
+            if n_bayesian_iter < 7:
+                print(f"警告: n_bayesian_iter={n_bayesian_iter} 小于最小需求(7)，使用默认参数")
+                raise ValueError(f"Expected `n_calls` >= 7, got {n_bayesian_iter}")
+                
             # 运行贝叶斯优化
             result = gp_minimize(
                 objective,
@@ -538,11 +614,11 @@ def train_xgboost_with_bayesian(df,
         # 保存窗口结果
         window_results.append({
             'window': start_idx + 1,
-            'model': best_model,
-            'best_params': best_params,
+            'best_params': best_params,  # 只保存参数，不保存完整模型对象
             'features_used': window_features,
             'metrics': window_metric,
-            'feature_importance': best_model.get_score(importance_type='gain')
+            'feature_importance': best_model.get_score(importance_type='gain'),
+            'model_path': f"{window_model_dir}/xgb_model.json"  # 保存模型路径而非模型对象
         })
         
         # 打印当前窗口评估结果
@@ -552,6 +628,13 @@ def train_xgboost_with_bayesian(df,
         print(f"方向准确率: {test_direction_accuracy:.6f}")
         print(f"盈亏比: {test_profit_loss_ratio:.6f}")
         print(f"符号正确时的平均收益: {avg_return_correct:.10f}")
+        
+        # 释放内存
+        del X_train, X_val, X_test, y_train, y_val, y_test, dtrain, dval, dtest
+        # 显式删除模型对象，避免在window_results中保留引用
+        del best_model
+        import gc
+        gc.collect()  # 强制垃圾回收
     
     # 没有成功训练任何窗口
     if not all_metrics:
@@ -648,92 +731,167 @@ def train_xgboost_with_bayesian(df,
     # 保存详细窗口指标
     detailed_window_metrics.to_csv(f"{output_dir}/detailed_window_metrics.csv", index=False)
     
-    # 添加参数与性能相关性分析
-    print("分析模型参数与性能指标的相关性...")
-    
-    # 提取参数列
-    param_cols = [col for col in detailed_window_metrics.columns if col.startswith('param_')]
-    
-    if len(param_cols) > 0:
-        # 主要性能指标
-        perf_cols = ['mse', 'r2', 'ic', 'direction_accuracy', 'profit_loss_ratio']
-        
-        # 计算每个参数与性能指标的相关性
-        corr_data = []
-        for param in param_cols:
-            param_name = param.replace('param_', '')
-            for perf in perf_cols:
-                # 计算Spearman相关系数
-                mask = ~detailed_window_metrics[param].isna() & ~detailed_window_metrics[perf].isna()
-                if mask.sum() > 5:  # 至少需要5个非NA值
-                    corr, p_value = stats.spearmanr(
-                        detailed_window_metrics.loc[mask, param], 
-                        detailed_window_metrics.loc[mask, perf]
-                    )
-                    corr_data.append({
-                        'Parameter': param_name,
-                        'Metric': perf,
-                        'Correlation': corr,
-                        'P_Value': p_value,
-                        'Significant': p_value < 0.05
-                    })
-        
-        # 创建相关性表格
-        if corr_data:
-            corr_df = pd.DataFrame(corr_data)
-            corr_df.to_csv(f"{output_dir}/param_performance_correlation.csv", index=False)
+    # 分析参数和性能指标的相关性
+    try:
+        if len(detailed_window_metrics) > 10:  # 确保有足够的数据进行分析
+            # 提取参数列（以'param_'开头的列）
+            param_cols = [col for col in detailed_window_metrics.columns if col.startswith('param_')]
             
-            # 创建重要参数可视化
-            significant_corrs = corr_df[corr_df['Significant']]
-            if len(significant_corrs) > 0:
-                plt.figure(figsize=(12, 8))
+            if param_cols:  # 确保有参数列
+                # 性能指标列
+                metric_cols = ['mse', 'r2', 'ic', 'direction_accuracy', 'profit_loss_ratio']
                 
-                # 根据相关性绝对值排序
-                significant_corrs['AbsCorr'] = significant_corrs['Correlation'].abs()
-                significant_corrs = significant_corrs.sort_values('AbsCorr', ascending=False).head(20)
+                # 创建相关性结果DataFrame
+                corr_results = []
                 
-                # 创建热力图数据
-                pivot_data = significant_corrs.pivot_table(
-                    index='Parameter', 
-                    columns='Metric', 
-                    values='Correlation',
-                    aggfunc='first'
-                ).fillna(0)
+                # 批量计算Spearman相关系数，减少内存使用
+                batch_size = min(50, len(detailed_window_metrics))
+                for param_col in param_cols:
+                    for metric_col in metric_cols:
+                        # 检查参数列是否包含足够的不同值
+                        unique_vals = detailed_window_metrics[param_col].nunique()
+                        if unique_vals <= 1:  # 跳过只有一个值的参数
+                            continue
+                            
+                        # 确保两列都有有效数值
+                        valid_data = detailed_window_metrics[[param_col, metric_col]].dropna()
+                        if len(valid_data) < 10:  # 至少需要10个有效样本
+                            continue
+                            
+                        try:
+                            # 随机抽样计算相关性以减少内存使用
+                            if len(valid_data) > batch_size:
+                                sample_data = valid_data.sample(batch_size, random_state=42)
+                            else:
+                                sample_data = valid_data
+                                
+                            # 计算Spearman相关系数
+                            corr, p_value = stats.spearmanr(
+                                sample_data[param_col], 
+                                sample_data[metric_col],
+                                nan_policy='omit'
+                            )
+                            
+                            # 只保留显著的相关性（p值<0.1）
+                            if not np.isnan(corr) and p_value < 0.1:
+                                corr_results.append({
+                                    'Parameter': param_col.replace('param_', ''),
+                                    'Metric': metric_col,
+                                    'Correlation': corr,
+                                    'P_Value': p_value,
+                                    'Significant': '***' if p_value < 0.01 else ('**' if p_value < 0.05 else '*')
+                                })
+                        except Exception as e:
+                            print(f"计算 {param_col} 和 {metric_col} 相关性时出错: {str(e)}")
+                            continue
                 
-                # 绘制热力图
-                sns.heatmap(pivot_data, annot=True, cmap='coolwarm', center=0, fmt='.2f')
-                plt.title('Significant Parameter-Performance Correlations')
-                plt.tight_layout()
-                plt.savefig(f"{output_dir}/param_performance_heatmap.png", dpi=300)
+                # 创建相关性DataFrame
+                if corr_results:
+                    corr_df = pd.DataFrame(corr_results)
+                    corr_df = corr_df.sort_values('P_Value')  # 按p值排序
+                    
+                    # 保存相关性结果
+                    corr_df.to_csv(f"{output_dir}/param_performance_correlation.csv", index=False)
+                    print(f"参数-性能相关性分析已保存至: {output_dir}/param_performance_correlation.csv")
+                    
+                    # 绘制热图 - 只绘制相关性强的部分
+                    if len(corr_df) > 3:  # 至少需要3个相关性结果才绘制热图
+                        try:
+                            # 用于绘制热图的数据准备
+                            sig_corr_df = corr_df[corr_df['P_Value'] < 0.05].copy()  # 只用显著的相关性
+                            if len(sig_corr_df) >= 3:  # 确保有足够的数据绘制热图
+                                pivot_df = sig_corr_df.pivot(
+                                    index='Parameter', 
+                                    columns='Metric', 
+                                    values='Correlation'
+                                )
+                                
+                                # 绘制热图
+                                plt.figure(figsize=(10, max(4, len(pivot_df) * 0.4)))  # 动态调整图形高度
+                                sns.heatmap(
+                                    pivot_df, 
+                                    annot=True, 
+                                    cmap='coolwarm', 
+                                    center=0,
+                                    linewidths=0.5,
+                                    fmt='.2f',
+                                    cbar_kws={'label': 'Spearman相关系数'}
+                                )
+                                plt.title('参数与性能指标的显著相关性')
+                                plt.tight_layout()
+                                plt.savefig(f"{output_dir}/param_performance_heatmap.png", dpi=100)
+                                plt.close()
+                        except Exception as e:
+                            print(f"绘制参数相关性热图时出错: {str(e)}")
+            else:
+                print("没有找到参数列进行相关性分析")
+        else:
+            print("窗口数量不足，跳过参数-性能相关性分析")
+    except Exception as e:
+        print(f"执行参数-性能相关性分析时出错: {str(e)}")
+        traceback.print_exc()
     
     # 创建分类表格 - 按性能分组分析窗口
-    print("按性能分组分析窗口...")
-    
-    # 根据IC值将窗口分为高、中、低三组
-    metrics_df['ic_group'] = pd.qcut(metrics_df['ic'], 3, labels=['Low', 'Medium', 'High'])
-    
-    # 按组计算特征数量和参数平均值
-    group_stats = []
-    for name, group in metrics_df.groupby('ic_group'):
-        if len(group) > 0:
-            # 窗口数量和性能指标
-            stat = {
-                'Group': name,
-                'Count': len(group),
-                'Avg_IC': group['ic'].mean(),
-                'Avg_Direction_Accuracy': group['direction_accuracy'].mean(),
-                'Avg_R2': group['r2'].mean()
-            }
+    try:
+        if len(detailed_window_metrics) >= 15:  # 确保有足够的窗口进行分组分析
+            print("创建窗口性能分组分析...")
             
-            # 添加窗口索引
-            stat['Windows'] = ', '.join(map(str, group['window'].tolist()))
+            # 使用IC值对窗口进行分组
+            detailed_window_metrics['IC_Group'] = pd.qcut(
+                detailed_window_metrics['ic'], 
+                q=3, 
+                labels=['低IC', '中IC', '高IC'],
+                duplicates='drop'  # 处理重复边界值
+            )
             
-            group_stats.append(stat)
-    
-    # 创建分组统计表格
-    if group_stats:
-        group_df = pd.DataFrame(group_stats)
-        group_df.to_csv(f"{output_dir}/performance_group_analysis.csv", index=False)
+            # 如果分组失败(例如，太多重复值)，使用自定义分组
+            if 'IC_Group' not in detailed_window_metrics.columns or detailed_window_metrics['IC_Group'].isna().all():
+                ic_median = detailed_window_metrics['ic'].median()
+                detailed_window_metrics['IC_Group'] = detailed_window_metrics['ic'].apply(
+                    lambda x: '高IC' if x > ic_median * 1.2 else ('低IC' if x < ic_median * 0.8 else '中IC')
+                )
+            
+            # 对每个组计算平均指标
+            group_stats = []
+            for group_name, group_data in detailed_window_metrics.groupby('IC_Group'):
+                if len(group_data) < 3:  # 跳过样本过少的组
+                    continue
+                    
+                # 计算基本指标的平均值和标准差
+                metric_columns = ['mse', 'r2', 'ic', 'direction_accuracy', 'profit_loss_ratio']
+                stats_dict = {'Group': group_name, 'Windows': len(group_data)}
+                
+                for metric in metric_columns:
+                    if metric in group_data.columns:
+                        valid_values = group_data[metric].dropna()
+                        if len(valid_values) >= 3:
+                            stats_dict[f'Avg_{metric}'] = valid_values.mean()
+                            stats_dict[f'Std_{metric}'] = valid_values.std()
+                
+                # 提取参数的平均值
+                param_columns = [col for col in group_data.columns if col.startswith('param_')]
+                for param in param_columns:
+                    valid_values = group_data[param].dropna()
+                    if len(valid_values) >= 3 and valid_values.nunique() > 1:
+                        param_name = param.replace('param_', '')
+                        stats_dict[f'Avg_{param_name}'] = valid_values.mean()
+                
+                group_stats.append(stats_dict)
+            
+            # 创建分组统计DataFrame
+            if group_stats:
+                group_df = pd.DataFrame(group_stats)
+                
+                # 保存分组分析结果
+                group_df.to_csv(f"{output_dir}/performance_group_analysis.csv", index=False)
+                print(f"窗口性能分组分析已保存至: {output_dir}/performance_group_analysis.csv")
+            else:
+                print("分组分析未生成有效结果，可能是因为组内数据不足")
+        else:
+            print("窗口数量不足，跳过窗口性能分组分析")
+    except Exception as e:
+        print(f"执行窗口性能分组分析时出错: {str(e)}")
+        traceback.print_exc()
     
     print(f"\n=== 整体评估指标 ===")
     print(f"窗口数量: {len(all_metrics)}")
@@ -756,172 +914,248 @@ def train_xgboost_with_bayesian(df,
     # 添加预测与实际值相关性分析
     print(f"预测与实际值相关性:")
     print(f"  - 皮尔逊相关系数: {stats.pearsonr(all_predictions[valid_mask], valid_returns)[0]:.6f}")
-    print(f"  - 斯皮尔曼相关系数: {stats.spearmanr(all_predictions[valid_mask], valid_returns)[0]:.6f}")
+    print(f"  - 斯皮尔曼相关系数: {spearmanr(all_predictions[valid_mask], valid_returns)[0]:.6f}")
     
-    # 平均特征重要性
-    # 因为使用了原生XGBoost接口，特征重要性的获取方式需要调整
-    all_feature_importance = {}
-    all_feature_usage = {}  # 记录每个特征被使用的次数
-    
-    # 收集所有窗口的特征重要性
-    for result in window_results:
-        importance_dict = result['feature_importance']
-        used_features = result['features_used']
-        
-        # 更新特征使用次数
-        for feature in used_features:
-            if feature not in all_feature_usage:
-                all_feature_usage[feature] = 0
-            all_feature_usage[feature] += 1
-        
-        # 更新特征重要性
-        for feature, importance in importance_dict.items():
-            if feature not in all_feature_importance:
-                all_feature_importance[feature] = []
-            all_feature_importance[feature].append(importance)
-    
-    # 计算平均特征重要性
-    avg_feature_importance = {}
-    for feature, values in all_feature_importance.items():
-        avg_feature_importance[feature] = np.mean(values)
-    
-    # 创建包含使用次数的特征重要性DataFrame
-    feature_importance_df = pd.DataFrame({
-        'Feature': list(avg_feature_importance.keys()),
-        'Importance': list(avg_feature_importance.values()),
-        'Usage_Count': [all_feature_usage.get(f, 0) for f in avg_feature_importance.keys()],
-        'Usage_Percentage': [all_feature_usage.get(f, 0) / len(window_results) * 100 for f in avg_feature_importance.keys()]
-    }).sort_values('Importance', ascending=False)
-    
-    feature_importance_df.to_csv(f"{output_dir}/avg_feature_importance.csv", index=False)
-    
-    # 可视化平均特征重要性（前20个）和使用频率
-    plt.figure(figsize=(14, 12))
-    top_n = min(20, len(feature_importance_df))
-    top_features = feature_importance_df.head(top_n)
-    
-    # 创建颜色映射，基于使用频率
-    norm = plt.Normalize(top_features['Usage_Percentage'].min(), top_features['Usage_Percentage'].max())
-    colors = plt.cm.viridis(norm(top_features['Usage_Percentage']))
-    
-    # 绘制特征重要性条形图
-    bars = plt.barh(top_features['Feature'], top_features['Importance'], color=colors)
-    
-    # 添加使用频率标签
-    for i, (_, row) in enumerate(top_features.iterrows()):
-        plt.text(row['Importance'] + row['Importance']*0.01, i, 
-                 f"{row['Usage_Percentage']:.1f}%", 
-                 va='center', fontsize=9)
-    
-    plt.title('Top 20 Features by Importance (color = usage frequency)')
-    plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=plt.cm.viridis), 
-                 label='Usage Percentage (%)')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/avg_feature_importance.png", dpi=300)
+    # 计算并可视化平均特征重要性
+    try:
+        if feature_importances and len(feature_importances) > 0:
+            # 转换为DataFrame
+            importance_df = pd.DataFrame(feature_importances)
+            
+            # 计算每个特征的平均重要性和使用频率
+            avg_importance = importance_df.groupby('feature').agg({
+                'importance': ['mean', 'std', 'count']
+            }).reset_index()
+            
+            # 整理列名
+            avg_importance.columns = ['feature', 'importance_mean', 'importance_std', 'usage_count']
+            
+            # 计算使用百分比
+            total_windows = len(feature_importances) / len(importance_df['feature'].unique())
+            avg_importance['usage_pct'] = avg_importance['usage_count'] / total_windows * 100
+            
+            # 按平均重要性排序
+            avg_importance = avg_importance.sort_values('importance_mean', ascending=False)
+            
+            # 保存到CSV
+            avg_importance.to_csv(f"{output_dir}/avg_feature_importance.csv", index=False)
+            print(f"平均特征重要性已保存至: {output_dir}/avg_feature_importance.csv")
+            
+            # 可视化顶部特征（最多10个以减少内存使用）
+            n_top_features = min(10, len(avg_importance))
+            if n_top_features > 1:  # 确保至少有2个特征才创建图表
+                top_features = avg_importance.head(n_top_features).copy()
+                
+                # 绘制重要性条形图
+                plt.figure(figsize=(8, 5))  # 减小图表尺寸
+                
+                # 创建条形图
+                bars = plt.barh(
+                    top_features['feature'],
+                    top_features['importance_mean'],
+                    xerr=top_features['importance_std'],
+                    alpha=0.6,
+                    color='darkblue',
+                    error_kw={'ecolor': 'black', 'elinewidth': 1, 'capsize': 3}
+                )
+                
+                # 添加使用频率标签
+                for i, bar in enumerate(bars):
+                    plt.text(
+                        bar.get_width() + bar.get_xerr() * 1.05,
+                        bar.get_y() + bar.get_height()/2,
+                        f"{top_features['usage_pct'].iloc[i]:.1f}%",
+                        va='center',
+                        fontsize=8
+                    )
+                
+                plt.xlabel('平均重要性', fontsize=10)
+                plt.title('顶部特征重要性及使用频率', fontsize=12)
+                plt.grid(axis='x', alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(f"{output_dir}/avg_feature_importance.png", dpi=100)
+                plt.close()  # 确保释放内存
+        else:
+            print("没有特征重要性数据可用于可视化")
+    except Exception as e:
+        print(f"生成特征重要性可视化时出错: {str(e)}")
+        traceback.print_exc()
     
     # 可视化每个窗口的IC值和方向准确率
-    plt.figure(figsize=(15, 8))
-    
-    plt.subplot(2, 1, 1)
-    ic_values = metrics_df['ic']
-    plt.bar(range(len(metrics_df)), ic_values, alpha=0.7, color='royalblue')
-    plt.axhline(y=0, color='r', linestyle='--')
-    plt.axhline(y=ic_values.mean(), color='g', linestyle='-', 
-                label=f'平均 IC: {ic_values.mean():.4f}')
-    plt.title('各窗口IC值')
-    plt.ylabel('Information Coefficient')
-    plt.legend()
-    
-    plt.subplot(2, 1, 2)
-    dir_acc = metrics_df['direction_accuracy']
-    plt.bar(range(len(metrics_df)), dir_acc, alpha=0.7, color='darkorange')
-    plt.axhline(y=0.5, color='r', linestyle='--', label='随机水平 (50%)')
-    plt.axhline(y=dir_acc.mean(), color='g', linestyle='-', 
-                label=f'平均方向准确率: {dir_acc.mean():.4f}')
-    plt.title('各窗口方向准确率')
-    plt.xlabel('窗口索引')
-    plt.ylabel('方向准确率')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/window_ic_and_direction.png", dpi=300)
-    
-    # 绘制R2和MSE趋势图
-    plt.figure(figsize=(15, 8))
-    
-    plt.subplot(2, 1, 1)
-    r2_values = metrics_df['r2']
-    plt.plot(range(len(metrics_df)), r2_values, 'o-', alpha=0.7, color='purple')
-    plt.axhline(y=0, color='r', linestyle='--')
-    plt.axhline(y=r2_values.mean(), color='g', linestyle='-', 
-                label=f'平均 R2: {r2_values.mean():.4f}')
-    plt.title('各窗口R²值')
-    plt.ylabel('R²')
-    plt.legend()
-    
-    plt.subplot(2, 1, 2)
-    mse_values = metrics_df['mse']
-    plt.semilogy(range(len(metrics_df)), mse_values, 'o-', alpha=0.7, color='teal')
-    plt.axhline(y=mse_values.mean(), color='g', linestyle='-', 
-                label=f'平均 MSE: {mse_values.mean():.10f}')
-    plt.title('各窗口MSE值 (对数尺度)')
-    plt.xlabel('窗口索引')
-    plt.ylabel('MSE (log scale)')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/window_r2_and_mse.png", dpi=300)
-    
-    # 绘制预测值与实际值的散点图 (添加密度等高线)
-    plt.figure(figsize=(10, 8))
-    
-    # 创建散点图
-    plt.scatter(all_predictions[valid_mask], valid_returns, alpha=0.3, s=10, color='blue')
-    
-    # 添加密度等高线
     try:
-        from scipy.stats import gaussian_kde
-        
-        # 计算点密度
-        xy = np.vstack([all_predictions[valid_mask], valid_returns])
-        density = gaussian_kde(xy)(xy)
-        
-        # 根据密度排序点
-        idx = density.argsort()
-        x, y, z = np.array(all_predictions[valid_mask])[idx], np.array(valid_returns)[idx], density[idx]
-        
-        # 绘制密度散点图
-        plt.scatter(x, y, c=z, s=15, alpha=0.5, cmap='viridis')
-        plt.colorbar(label='点密度')
+        if len(metrics_df) >= 5:  # 确保有足够的窗口数据才生成图表
+            print("生成IC和方向准确率可视化...")
+            
+            # 创建单个图表展示IC和方向准确率，减少内存消耗
+            plt.figure(figsize=(10, 6))
+            
+            # 绘制IC值
+            ax1 = plt.subplot(111)
+            ax1.plot(range(len(metrics_df)), metrics_df['ic'], 'o-', color='royalblue', alpha=0.7, label='IC')
+            ax1.axhline(y=metrics_df['ic'].mean(), color='royalblue', linestyle='--', 
+                        label=f'平均 IC: {metrics_df["ic"].mean():.4f}')
+            ax1.set_ylabel('信息系数 (IC)', color='royalblue')
+            ax1.tick_params(axis='y', labelcolor='royalblue')
+            ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+            
+            # 创建共享x轴的第二个y轴 - 方向准确率
+            ax2 = ax1.twinx()
+            ax2.plot(range(len(metrics_df)), metrics_df['direction_accuracy'], 'o-', 
+                     color='darkorange', alpha=0.7, label='方向准确率')
+            ax2.axhline(y=metrics_df['direction_accuracy'].mean(), color='darkorange', linestyle='--',
+                        label=f'平均方向准确率: {metrics_df["direction_accuracy"].mean():.4f}')
+            ax2.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, label='随机水平 (0.5)')
+            ax2.set_ylabel('方向准确率', color='darkorange')
+            ax2.tick_params(axis='y', labelcolor='darkorange')
+            
+            # 合并图例
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=9)
+            
+            plt.title('各窗口IC值和方向准确率')
+            plt.xlabel('窗口索引')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/window_ic_and_direction.png", dpi=100)
+            plt.close()  # 确保释放内存
+        else:
+            print("窗口数量不足，跳过IC和方向准确率可视化")
     except Exception as e:
-        print(f"绘制密度图失败: {e}")
+        print(f"生成IC和方向准确率可视化时出错: {str(e)}")
+        traceback.print_exc()
     
-    # 添加拟合线
+    # 绘制预测值与实际值的散点图
     try:
-        from scipy.stats import linregress
-        slope, intercept, r_value, p_value, std_err = linregress(all_predictions[valid_mask], valid_returns)
-        plt.plot(np.sort(all_predictions[valid_mask]), 
-                intercept + slope * np.sort(all_predictions[valid_mask]), 
-                'r-', linewidth=2, 
-                label=f'拟合线 (r={r_value:.4f})')
+        print("生成预测值与实际值散点图...")
+        
+        # 确保有足够的有效预测数据
+        valid_preds_mask = ~np.isnan(all_predictions) & ~np.isinf(all_predictions)
+        valid_returns_mask = ~np.isnan(valid_returns) & ~np.isinf(valid_returns)
+        
+        if valid_mask_array.sum() > 0 and valid_preds_mask.sum() > 0 and valid_returns_mask.sum() > 10:
+            # 获取有效数据索引
+            valid_indices = np.where(valid_mask_array)[0]
+            
+            # 限制可视化点数，减少内存使用
+            max_points = min(3000, len(valid_indices))
+            
+            # 随机采样以减少点数
+            if len(valid_indices) > max_points:
+                np.random.seed(42)  # 固定随机种子以便复现
+                sampled_indices = np.random.choice(valid_indices, max_points, replace=False)
+                sampled_mask = np.zeros_like(valid_mask_array, dtype=bool)
+                sampled_mask[sampled_indices] = True
+                
+                # 确定最终用于绘图的数据
+                plot_mask = sampled_mask & valid_preds_mask
+                plot_predictions = all_predictions[plot_mask]
+                
+                # 获取对应的实际收益率
+                valid_indices_in_returns = np.where(valid_mask_array[plot_mask])[0]
+                if len(valid_indices_in_returns) > 0:
+                    plot_returns = valid_returns.iloc[valid_indices_in_returns]
+                else:
+                    print("采样后没有有效数据点，跳过散点图生成")
+                    return
+            else:
+                # 数据点较少时直接使用全部有效点
+                plot_mask = valid_mask_array & valid_preds_mask
+                plot_predictions = all_predictions[plot_mask]
+                plot_returns = valid_returns
+            
+            # 计算预测值和实际值的范围
+            p_min, p_max = np.percentile(plot_predictions, [1, 99])  # 使用百分位数减少离群值影响
+            r_min, r_max = np.percentile(plot_returns, [1, 99])
+            
+            # 创建散点图
+            plt.figure(figsize=(8, 8))
+            
+            # 添加对角线（理想情况）
+            min_val = min(p_min, r_min)
+            max_val = max(p_max, r_max)
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, label='理想预测线')
+            
+            # 绘制散点图
+            plt.scatter(plot_predictions, plot_returns, alpha=0.5, s=10, color='darkblue')
+            
+            # 添加趋势线
+            try:
+                z = np.polyfit(plot_predictions, plot_returns, 1)
+                p = np.poly1d(z)
+                plt.plot(
+                    [p_min, p_max], 
+                    [p(p_min), p(p_max)], 
+                    'g-', 
+                    label=f'拟合线 (斜率={z[0]:.4f})'
+                )
+            except Exception as e:
+                print(f"绘制趋势线失败: {str(e)}")
+            
+            # 添加统计信息
+            corr = np.corrcoef(plot_predictions, plot_returns)[0, 1]
+            plt.text(
+                0.05, 0.95, 
+                f"相关系数: {corr:.4f}\n点数: {len(plot_predictions)}", 
+                transform=plt.gca().transAxes, 
+                verticalalignment='top', 
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+            
+            plt.title('预测值 vs 实际收益率')
+            plt.xlabel('预测值')
+            plt.ylabel('实际收益率')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            
+            # 保存图片并释放内存
+            plt.savefig(f"{output_dir}/predictions_vs_returns.png", dpi=100)
+            plt.close()
+        else:
+            print("有效预测数据不足，跳过散点图生成")
     except Exception as e:
-        print(f"绘制拟合线失败: {e}")
+        print(f"生成预测值与实际值散点图时出错: {str(e)}")
+        traceback.print_exc()
     
-    plt.xlabel('预测值')
-    plt.ylabel('实际收益率')
-    plt.title('预测值 vs 实际收益率')
-    plt.grid(True, alpha=0.3)
-    plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-    plt.axvline(x=0, color='r', linestyle='--', alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/predictions_vs_actual.png", dpi=300)
+    # 绘制R2和MSE趋势图（可选）
+    # 只在窗口数量足够多时生成，避免过多图形
+    if len(metrics_df) >= 5:  # 至少有5个窗口才绘制趋势图
+        print("生成R2和MSE趋势图...")
+        plt.figure(figsize=(10, 6))
+        
+        ax1 = plt.subplot(111)
+        ax1.plot(range(len(metrics_df)), metrics_df['r2'], 'o-', alpha=0.7, color='purple', label='R²')
+        ax1.set_ylabel('R²', color='purple')
+        ax1.tick_params(axis='y', labelcolor='purple')
+        ax1.axhline(y=0, color='r', linestyle='--', alpha=0.3)
+        
+        # 创建共享x轴的第二个y轴
+        ax2 = ax1.twinx()
+        ax2.semilogy(range(len(metrics_df)), metrics_df['mse'], 'o-', alpha=0.7, color='teal', label='MSE')
+        ax2.set_ylabel('MSE (log)', color='teal')
+        ax2.tick_params(axis='y', labelcolor='teal')
+        
+        # 合并图例
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+        
+        plt.title('各窗口R²和MSE趋势')
+        plt.xlabel('窗口索引')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/window_r2_and_mse.png", dpi=100)
+        plt.close()  # 确保释放内存
     
     # 绘制分位数分析图
+    # 减少数据量，抽样处理
+    if len(pred_df) > 10000:
+        pred_df = pred_df.sample(10000, random_state=42)
+    
     plt.figure(figsize=(12, 8))
     
     # 将预测分成10个分位数
-    pred_df = pd.DataFrame({'pred': all_predictions[valid_mask], 'actual': valid_returns})
     pred_df['quantile'] = pd.qcut(pred_df['pred'], 10, labels=False)
     
     # 计算每个分位数的平均实际收益率
@@ -936,7 +1170,8 @@ def train_xgboost_with_bayesian(df,
     plt.title('预测分位数收益分析')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/quantile_returns.png", dpi=300)
+    plt.savefig(f"{output_dir}/quantile_returns.png", dpi=150)  # 降低dpi以减少内存使用
+    plt.close()  # 确保释放内存
     
     # 保存完整预测结果
     prediction_df = pd.DataFrame({
@@ -946,7 +1181,26 @@ def train_xgboost_with_bayesian(df,
         'actual_return': df[target_col],
         'prediction': all_predictions
     })
-    prediction_df.to_csv(f"{output_dir}/all_predictions.csv", index=False)
+    
+    # 按批次保存，减少内存使用
+    chunk_size = 100000  # 每个批次的行数
+    n_chunks = (len(prediction_df) + chunk_size - 1) // chunk_size  # 向上取整
+    
+    # 创建一个空的CSV文件，写入列名
+    prediction_df.iloc[0:0].to_csv(f"{output_dir}/all_predictions.csv", index=False)
+    
+    # 按批次追加数据
+    for i in range(n_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, len(prediction_df))
+        chunk = prediction_df.iloc[start_idx:end_idx]
+        # 追加模式写入CSV
+        chunk.to_csv(f"{output_dir}/all_predictions.csv", mode='a', header=False, index=False)
+        # 清理临时数据
+        del chunk
+    
+    # 清理预测数据框以释放内存
+    del prediction_df
     
     # 分析信号分布
     signal_stats = analyze_signal_distribution(all_predictions[valid_mask], valid_returns)
@@ -966,8 +1220,7 @@ def train_xgboost_with_bayesian(df,
             'information_ratio': information_ratio
         },
         'signal_stats': signal_stats,
-        'feature_importance': feature_importance_df,
-        'predictions_df': prediction_df
+        'feature_importance': avg_importance,
     }
     
     return results

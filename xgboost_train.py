@@ -24,6 +24,11 @@ def main():
     parser.add_argument('--standardize', action='store_true', help='是否对特征进行标准化处理，默认开启')
     args = parser.parse_args()
     
+    # 验证贝叶斯优化迭代次数
+    if args.n_iter < 7:
+        print(f"警告: 贝叶斯优化迭代次数 {args.n_iter} 小于最小要求(7)，已自动调整为10")
+        args.n_iter = 10
+    
     if args.output_dir is None:
         args.output_dir = f"xgboost_results_{args.train_days}_{args.val_days}_{args.test_days}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
