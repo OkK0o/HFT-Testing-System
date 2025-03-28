@@ -208,6 +208,311 @@ def compute_multiple_factors(df: pd.DataFrame,
     print("\n所有因子计算完成!")
     return result_df
 
+def compute_factors_in_chunks(df: pd.DataFrame, 
+                             factor_names: List[str], 
+                             chunk_size: int = 500000, 
+                             overlap_size: int = 100000,
+                             adjust_sign: bool = False,
+                             return_periods: List[int] = None) -> pd.DataFrame:
+    """
+    分块计算因子，用于处理大规模数据，并解决滑动窗口因子边界问题
+    
+    Args:
+        df: 输入的DataFrame数据
+        factor_names: 要计算的因子名称列表
+        chunk_size: 每块数据的大小
+        overlap_size: 块之间的重叠区域大小，用于解决历史滑动窗口因子边界问题
+        adjust_sign: 是否根据IC调整因子符号
+        return_periods: 用于计算IC的收益率周期，默认为[10]
+        
+    Returns:
+        添加了所有因子的DataFrame
+    """
+    # 注册所有因子
+    register_all_factors()
+    
+    # 设置默认的收益率周期
+    if return_periods is None:
+        return_periods = [10]
+    
+    # 确保数据是按时间排序的
+    if 'DateTime' in df.columns:
+        df = df.sort_values(['DateTime', 'InstruID']).reset_index(drop=True)
+    elif 'TradDay' in df.columns and 'UpdateTime' in df.columns:
+        df = df.sort_values(['TradDay', 'UpdateTime', 'InstruID']).reset_index(drop=True)
+    elif 'date' in df.columns:
+        df = df.sort_values(['date', 'InstruID']).reset_index(drop=True)
+    
+    # 确保重叠区域大小合理
+    if overlap_size >= chunk_size:
+        overlap_size = chunk_size // 2
+        print(f"重叠区域大小调整为: {overlap_size}")
+    
+    # 获取数据集大小
+    total_rows = len(df)
+    print(f"数据集总行数: {total_rows}")
+    print(f"分块大小: {chunk_size}, 重叠区域: {overlap_size}")
+    
+    # 计算需要处理的块数
+    num_chunks = (total_rows - overlap_size) // (chunk_size - overlap_size)
+    if (total_rows - overlap_size) % (chunk_size - overlap_size) > 0:
+        num_chunks += 1
+    
+    print(f"需要处理的块数: {num_chunks}")
+    
+    # 初始化结果数据框
+    final_df = df.copy()
+    # 用于存储每个因子的值
+    factor_values = {factor: pd.Series(index=df.index, dtype='float64') for factor in factor_names}
+    
+    # 获取因子信息
+    factor_info = FactorManager.get_factor_info()
+    
+    # 按块处理数据
+    for chunk_idx in range(num_chunks):
+        # 计算当前块的起始索引和结束索引
+        start_idx = chunk_idx * (chunk_size - overlap_size)
+        end_idx = min(start_idx + chunk_size, total_rows)
+        
+        # 对第一个块，始终从0开始
+        if chunk_idx == 0:
+            start_idx = 0
+        
+        # 提取当前块的数据
+        chunk_df = df.iloc[start_idx:end_idx].copy()
+        
+        # 输出处理进度
+        print(f"\n处理第 {chunk_idx + 1}/{num_chunks} 块数据 (索引 {start_idx} 到 {end_idx-1}), 大小: {len(chunk_df)} 行")
+        
+        # 计算当前块的因子
+        chunk_with_factors = compute_multiple_factors(chunk_df, factor_names, adjust_sign=False)
+        
+        # 如果需要调整符号，在当前块上直接计算和调整
+        if adjust_sign:
+            try:
+                print(f"调整第 {chunk_idx + 1} 块的因子符号...")
+                # 计算前向收益率
+                test_df = FactorsTester.calculate_forward_returns(chunk_with_factors, periods=return_periods)
+                
+                # 为每个因子计算IC值并调整符号
+                config = FactorTestConfig(return_periods=return_periods)
+                for factor_name in factor_names:
+                    if factor_name in chunk_with_factors.columns:
+                        # 计算IC
+                        ic_df = FactorsTester.calculate_ic(
+                            test_df, 
+                            factor_names=factor_name,
+                            return_periods=return_periods, 
+                            method=config.ic_method
+                        )
+                        
+                        # 获取平均IC
+                        if not ic_df.empty:
+                            ic_col = f'{factor_name}_{return_periods[0]}period_ic'
+                            if ic_col in ic_df.columns:
+                                mean_ic = ic_df[ic_col].mean()
+                                
+                                # 如果IC为负，调整因子符号
+                                if mean_ic < 0:
+                                    chunk_with_factors[factor_name] = -chunk_with_factors[factor_name]
+                                    print(f"  调整因子 {factor_name} 的符号 (块内平均IC: {mean_ic:.4f})")
+            except Exception as e:
+                print(f"调整第 {chunk_idx + 1} 块因子符号时出错: {str(e)}")
+                print("继续使用未调整的因子值")
+        
+        # 有效数据区域计算：排除头部重叠区域
+        valid_start_idx = 0
+        valid_end_idx = len(chunk_df)
+        
+        # 确定有效区域 (排除重叠区域的开始部分，第一个块除外)
+        # 因为大多数因子只依赖历史数据，头部可能缺乏足够的历史计算窗口
+        if chunk_idx > 0:
+            valid_start_idx = overlap_size
+        
+        # 不排除尾部区域，因为大多数因子不依赖未来数据
+        
+        # 提取有效区域的因子值并更新最终结果
+        for factor in factor_names:
+            if factor in chunk_with_factors.columns:
+                # 取当前块的有效区域
+                valid_chunk_indices = chunk_df.index[valid_start_idx:valid_end_idx]
+                original_indices = df.index[start_idx + valid_start_idx:start_idx + valid_end_idx]
+                
+                # 将有效区域的因子值赋给最终结果
+                if len(valid_chunk_indices) > 0:
+                    # 确保索引匹配
+                    factor_values[factor].loc[original_indices] = chunk_with_factors.loc[valid_chunk_indices, factor].values
+        
+        # 释放内存
+        del chunk_df, chunk_with_factors
+        import gc
+        gc.collect()
+        print(f"第 {chunk_idx + 1} 块处理完成，已释放内存")
+    
+    # 将计算的因子添加到最终结果中
+    for factor in factor_names:
+        if not factor_values[factor].isna().all():  # 确保有计算结果
+            final_df[factor] = factor_values[factor]
+            print(f"因子 {factor} 添加完成，非空值: {factor_values[factor].count()}/{len(factor_values[factor])}")
+    
+    print("\n分块因子计算完成!")
+    return final_df
+
+def adjust_factor_signs_in_chunks(df: pd.DataFrame, 
+                                factor_names: List[str] = None, 
+                                return_periods: List[int] = None,
+                                chunk_size: int = 500000) -> pd.DataFrame:
+    """
+    分块调整因子符号，避免内存溢出
+    
+    Args:
+        df: 包含因子的DataFrame数据
+        factor_names: 要调整的因子列表，如果为None则调整所有可用因子
+        return_periods: 用于计算IC的收益率周期，默认为[10]
+        chunk_size: 每次处理的数据块大小
+        
+    Returns:
+        调整符号后的DataFrame
+    """
+    result_df = df.copy()
+    
+    # 如果未指定因子，则获取所有已计算的因子
+    if factor_names is None:
+        factor_info = FactorManager.get_factor_info()
+        all_factors = factor_info['name'].tolist()
+        factor_names = [col for col in df.columns if col in all_factors]
+    
+    # 使用默认收益率周期
+    if return_periods is None:
+        return_periods = [10]
+        
+    print(f"\n开始分块调整 {len(factor_names)} 个因子的符号...")
+    
+    # 为每个因子确定符号调整方向
+    factor_signs = {}  # 存储每个因子是否需要反转符号
+    
+    # 获取数据集大小
+    total_rows = len(df)
+    num_chunks = (total_rows + chunk_size - 1) // chunk_size
+    
+    # 按因子分别处理，降低内存压力
+    for factor_name in factor_names:
+        if factor_name not in result_df.columns:
+            print(f"警告: 因子 {factor_name} 不在数据中，跳过")
+            continue
+            
+        # 计算抽样的IC值
+        ic_values = []
+        
+        # 对每个块计算IC，然后合并结果
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, total_rows)
+            
+            chunk_df = result_df.iloc[start_idx:end_idx].copy()
+            
+            # 首先计算前向收益率 (仅处理当前块)
+            try:
+                chunk_df = FactorsTester.calculate_forward_returns(chunk_df, periods=return_periods)
+                
+                # 计算IC (仅使用当前块)
+                config = FactorTestConfig(return_periods=return_periods)
+                ic_df = FactorsTester.calculate_ic(
+                    chunk_df, 
+                    factor_names=factor_name,
+                    return_periods=return_periods, 
+                    method=config.ic_method
+                )
+                
+                if not ic_df.empty:
+                    ic_col = f'{factor_name}_{return_periods[0]}period_ic'
+                    if ic_col in ic_df.columns:
+                        # 收集IC值
+                        ic_values.extend(ic_df[ic_col].dropna().tolist())
+                
+            except Exception as e:
+                print(f"计算因子 {factor_name} 的IC值时出错: {str(e)}")
+                continue
+                
+            # 释放内存
+            del chunk_df
+            gc.collect()
+        
+        # 根据平均IC值确定是否需要调整符号
+        if ic_values:
+            mean_ic = sum(ic_values) / len(ic_values)
+            if mean_ic < 0:
+                factor_signs[factor_name] = -1
+                print(f"因子 {factor_name} 需要反转符号 (平均IC: {mean_ic:.4f})")
+            else:
+                factor_signs[factor_name] = 1
+                print(f"因子 {factor_name} 保持原符号 (平均IC: {mean_ic:.4f})")
+    
+    # 应用符号调整
+    for factor_name, sign in factor_signs.items():
+        if sign == -1:
+            result_df[factor_name] = -result_df[factor_name]
+            print(f"已反转因子 {factor_name} 的符号")
+    
+    print(f"\n分块调整因子符号完成!")        
+    return result_df
+
+def compute_factors_by_contract(df: pd.DataFrame, 
+                              factor_names: List[str], 
+                              adjust_sign: bool = False) -> pd.DataFrame:
+    """
+    按合约分组计算因子，适用于大规模数据处理
+    
+    Args:
+        df: 输入的DataFrame数据
+        factor_names: 要计算的因子名称列表
+        adjust_sign: 是否根据IC调整因子符号
+        
+    Returns:
+        添加了所有因子的DataFrame
+    """
+    # 注册所有因子
+    register_all_factors()
+    
+    # 获取所有唯一合约
+    contracts = df['InstruID'].unique()
+    print(f"共有 {len(contracts)} 个合约需要处理")
+    
+    # 初始化结果数据框
+    result_df = df.copy()
+    
+    # 按合约处理数据
+    for i, contract in enumerate(contracts):
+        print(f"\n处理合约 {i+1}/{len(contracts)}: {contract}")
+        
+        # 提取当前合约的数据
+        contract_df = df[df['InstruID'] == contract].copy()
+        
+        try:
+            # 计算当前合约的因子
+            contract_with_factors = compute_multiple_factors(contract_df, factor_names, adjust_sign=False)
+            
+            # 将计算结果更新回结果数据框
+            for factor in factor_names:
+                if factor in contract_with_factors.columns:
+                    result_df.loc[contract_df.index, factor] = contract_with_factors[factor].values
+            
+        except Exception as e:
+            print(f"计算合约 {contract} 的因子时出错: {str(e)}")
+        
+        # 释放内存
+        del contract_df
+        import gc
+        gc.collect()
+    
+    # 如果需要调整符号
+    if adjust_sign:
+        print("\n调整因子符号...")
+        result_df = adjust_factor_signs(result_df, factor_names=factor_names)
+    
+    print("\n按合约计算因子完成!")
+    return result_df
+
 def compute_all_factors(df: pd.DataFrame) -> pd.DataFrame:
     """
     计算所有已注册的因子
