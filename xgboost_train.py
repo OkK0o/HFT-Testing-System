@@ -3,6 +3,7 @@ import numpy as np
 import xgboost_signal
 import factor_register
 from factor_manager import FactorManager, FactorFrequency
+from factors_test import FactorsTester
 from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -22,7 +23,11 @@ def main():
     parser.add_argument('--scale-factor', type=int, default=10000, help='目标变量缩放因子，默认10000')
     parser.add_argument('--standardize', action='store_true', help='是否对特征进行标准化处理，默认开启')
     parser.add_argument('--periods', type=int, default=10, help='计算period_return的周期，默认10')
+    parser.add_argument('--price-col', type=str, default='mid_price', help='用于计算收益率的价格列，默认mid_price')
     args = parser.parse_args()
+    
+    # 构建目标变量列名
+    target_col = f'{args.periods}period_return'
     
     if args.n_iter < 7:
         print(f"警告: 贝叶斯优化迭代次数 {args.n_iter} 小于最小要求(7)，已自动调整为10")
@@ -52,17 +57,20 @@ def main():
         return
     
     print(f"计算{args.periods}period_return...")
-    df['10period_return'] = df.groupby('InstruID')['mid_price'].transform(
-        lambda x: x.pct_change(args.periods).shift(-args.periods)
+    # 使用FactorsTester.calculate_forward_returns方法计算收益率
+    df = FactorsTester.calculate_forward_returns(
+        df=df, 
+        periods=[args.periods], 
+        price_col=args.price_col
     )
     
-    print(f"目标变量 '10period_return' 统计:")
-    print(f"  - 均值: {df['10period_return'].mean():.8f}")
-    print(f"  - 标准差: {df['10period_return'].std():.8f}")
-    print(f"  - 中位数: {df['10period_return'].median():.8f}")
-    print(f"  - 最小值: {df['10period_return'].min():.8f}")
-    print(f"  - 最大值: {df['10period_return'].max():.8f}")
-    print(f"  - 非空值数量: {df['10period_return'].count()}")
+    print(f"目标变量 '{target_col}' 统计:")
+    print(f"  - 均值: {df[target_col].mean():.8f}")
+    print(f"  - 标准差: {df[target_col].std():.8f}")
+    print(f"  - 中位数: {df[target_col].median():.8f}")
+    print(f"  - 最小值: {df[target_col].min():.8f}")
+    print(f"  - 最大值: {df[target_col].max():.8f}")
+    print(f"  - 非空值数量: {df[target_col].count()}")
     
     print("进行特征预处理...")
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -91,7 +99,7 @@ def main():
         print(f"基于特征与目标变量的相关性筛选特征 (阈值: {args.feature_corr_cutoff})...")
         correlations = {}
         for feature in valid_factors:
-            corr = np.abs(df[[feature, '10period_return']].corr().iloc[0, 1])
+            corr = np.abs(df[[feature, target_col]].corr().iloc[0, 1])
             correlations[feature] = corr
         
         selected_features = [f for f, c in correlations.items() if c > args.feature_corr_cutoff]
@@ -105,7 +113,7 @@ def main():
     
     print("删除含有缺失值的行...")
     rows_before = len(df)
-    df.dropna(subset=['10period_return'] + selected_features, inplace=True)
+    df.dropna(subset=[target_col] + selected_features, inplace=True)
     rows_after = len(df)
     print(f"删除NaN后剩余样本数: {rows_after} (删除了 {rows_before - rows_after} 行)")
     
@@ -117,7 +125,7 @@ def main():
     start_time = datetime.now()
     results = xgboost_signal.train_xgboost_with_bayesian(
         df=df,
-        target_col='10period_return',
+        target_col=target_col,  # 使用动态生成的目标列名
         feature_cols=selected_features,
         train_days=args.train_days,
         val_days=args.val_days,
