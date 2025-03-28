@@ -5,9 +5,11 @@ from factor_register import register_all_factors
 from fin_data_processor import FinDataProcessor
 from factors_test import FactorsTester, FactorTestConfig
 import pandas as pd
+import numpy as np
 import datetime
-from typing import List, Dict
+from typing import List, Dict, Union, Tuple
 import os
+import gc
 
 def run_factor_compute(df: pd.DataFrame, 
                       factor_name: str = None, 
@@ -345,7 +347,6 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         
         # 释放内存
         del chunk_df, chunk_with_factors
-        import gc
         gc.collect()
         print(f"第 {chunk_idx + 1} 块处理完成，已释放内存")
     
@@ -502,7 +503,6 @@ def compute_factors_by_contract(df: pd.DataFrame,
         
         # 释放内存
         del contract_df
-        import gc
         gc.collect()
     
     # 如果需要调整符号
@@ -605,6 +605,134 @@ def adjust_factor_signs(df: pd.DataFrame,
         print(", ".join(adjusted_factors))
         
     return result_df
+
+# 添加因子平滑函数
+def smooth_factor(df: pd.DataFrame, 
+                 factor_name: str, 
+                 window: int = 5, 
+                 method: str = 'sma') -> pd.DataFrame:
+    """
+    平滑单个因子
+    
+    Args:
+        df: 输入DataFrame，必须包含factor_name列
+        factor_name: 要平滑的因子名称
+        window: 平滑窗口大小
+        method: 平滑方法，'sma'=简单移动平均，'ema'=指数移动平均
+        
+    Returns:
+        添加了平滑因子的DataFrame
+    """
+    result_df = df.copy()
+    
+    # 检查因子是否存在
+    if factor_name not in result_df.columns:
+        raise ValueError(f"因子 '{factor_name}' 不在数据中")
+    
+    # 生成平滑因子名称
+    method_suffix = 'sma' if method == 'sma' else 'ema'
+    smoothed_name = f"{factor_name}_{method_suffix}{window}"
+    
+    # 确保数据已按时间排序
+    if 'DateTime' in result_df.columns:
+        result_df = result_df.sort_values(['InstruID', 'DateTime'])
+    elif 'TradDay' in result_df.columns and 'UpdateTime' in result_df.columns:
+        result_df = result_df.sort_values(['InstruID', 'TradDay', 'UpdateTime'])
+    elif 'date' in result_df.columns:
+        result_df = result_df.sort_values(['InstruID', 'date'])
+    
+    # 应用平滑
+    if method == 'sma':
+        # 简单移动平均
+        result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+            lambda x: x.rolling(window=window, min_periods=1).mean()
+        )
+    elif method == 'ema':
+        # 指数移动平均
+        result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+            lambda x: x.ewm(span=window, min_periods=1).mean()
+        )
+    else:
+        raise ValueError(f"不支持的平滑方法: {method}，支持的方法有 'sma', 'ema'")
+    
+    print(f"平滑因子 {factor_name} 完成 -> {smoothed_name}")
+    return result_df
+
+def smooth_factors(df: pd.DataFrame, 
+                  factor_names: List[str], 
+                  windows: Union[List[int], int] = 5, 
+                  methods: Union[List[str], str] = 'sma',
+                  register_factors: bool = True) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    批量平滑多个因子
+    
+    Args:
+        df: 输入DataFrame，必须包含factor_names列
+        factor_names: 要平滑的因子名称列表
+        windows: 平滑窗口大小，可以是单个整数或与factor_names等长的列表
+        methods: 平滑方法，可以是单个字符串或与factor_names等长的列表
+        register_factors: 是否将平滑因子注册到FactorManager中
+        
+    Returns:
+        (添加了平滑因子的DataFrame, 生成的平滑因子名称列表)
+    """
+    result_df = df.copy()
+    smoothed_names = []
+    
+    # 规范化windows参数
+    if isinstance(windows, int):
+        windows = [windows] * len(factor_names)
+    elif len(windows) != len(factor_names):
+        raise ValueError("windows参数长度必须为1或与factor_names相同")
+    
+    # 规范化methods参数
+    if isinstance(methods, str):
+        methods = [methods] * len(factor_names)
+    elif len(methods) != len(factor_names):
+        raise ValueError("methods参数长度必须为1或与factor_names相同")
+    
+    # 逐个因子处理
+    for i, factor_name in enumerate(factor_names):
+        window = windows[i]
+        method = methods[i]
+        
+        # 检查因子是否存在
+        if factor_name not in result_df.columns:
+            print(f"警告: 因子 '{factor_name}' 不在数据中，跳过")
+            continue
+        
+        # 生成平滑因子名称
+        method_suffix = 'sma' if method == 'sma' else 'ema'
+        smoothed_name = f"{factor_name}_{method_suffix}{window}"
+        
+        # 应用平滑
+        if method == 'sma':
+            # 简单移动平均
+            result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean()
+            )
+        elif method == 'ema':
+            # 指数移动平均
+            result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+                lambda x: x.ewm(span=window, min_periods=1).mean()
+            )
+        else:
+            print(f"警告: 不支持的平滑方法: {method}，跳过因子 {factor_name}")
+            continue
+        
+        # 注册平滑因子
+        if register_factors:
+            try:
+                FactorManager.register_smoothed_factor(factor_name, window, method)
+                print(f"因子 {smoothed_name} 已注册到FactorManager")
+            except Exception as e:
+                print(f"注册因子 {smoothed_name} 失败: {str(e)}")
+        
+        smoothed_names.append(smoothed_name)
+        print(f"平滑因子 {factor_name} 完成 -> {smoothed_name}")
+    
+    print(f"批量平滑完成，共添加 {len(smoothed_names)} 个平滑因子")
+    return result_df, smoothed_names
 
 if __name__ == "__main__":
     df = pd.read_feather("data.feather")

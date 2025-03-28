@@ -10,6 +10,7 @@ class FactorFrequency(Enum):
     """因子频率枚举"""
     TICK = "tick"
     MINUTE = "minute"
+    SMOOTHED = "smoothed"  # 添加平滑因子类型
 
 class FactorRegistry:
     """因子注册管理器"""
@@ -19,6 +20,7 @@ class FactorRegistry:
         self.categories: Dict[str, Set[str]] = {}  # 因子分类
         self.dependencies: Dict[str, Set[str]] = {}  # 因子依赖关系
         self.frequencies: Dict[str, FactorFrequency] = {}  # 因子频率
+        self.smoothed_factors: Dict[str, Dict] = {}  # 存储平滑因子信息
     
     def register(self, 
                 name: str, 
@@ -61,6 +63,65 @@ class FactorRegistry:
             
             return wrapper
         return decorator
+        
+    def register_smoothed_factor(self, 
+                               original_name: str, 
+                               window: int,
+                               method: str = 'sma') -> str:
+        """
+        注册平滑因子
+        
+        Args:
+            original_name: 原始因子名称
+            window: 平滑窗口大小
+            method: 平滑方法，'sma'=简单移动平均，'ema'=指数移动平均
+            
+        Returns:
+            平滑因子名称
+        """
+        if original_name not in self.factors:
+            raise ValueError(f"原始因子 '{original_name}' 不存在")
+            
+        # 生成平滑因子名称
+        method_suffix = 'sma' if method == 'sma' else 'ema'
+        smoothed_name = f"{original_name}_{method_suffix}{window}"
+        
+        # 原始因子的信息
+        original_info = self.factors[original_name]
+        
+        # 注册平滑因子
+        self.factors[smoothed_name] = {
+            'function': None,  # 平滑因子的函数是动态计算的，不需要提前定义
+            'category': 'smoothed',  # 使用专门的平滑因子类别
+            'description': f"{original_info['description']} ({method_suffix.upper()}{window}平滑)",
+            'dependencies': [original_name],  # 依赖原始因子
+            'frequency': FactorFrequency.SMOOTHED,  # 使用SMOOTHED频率类型
+            'smoothing_info': {
+                'original_factor': original_name,
+                'window': window,
+                'method': method
+            }
+        }
+        
+        # 更新分类
+        if 'smoothed' not in self.categories:
+            self.categories['smoothed'] = set()
+        self.categories['smoothed'].add(smoothed_name)
+        
+        # 更新依赖
+        self.dependencies[smoothed_name] = set([original_name])
+        
+        # 更新频率
+        self.frequencies[smoothed_name] = FactorFrequency.SMOOTHED
+        
+        # 记录平滑因子信息
+        self.smoothed_factors[smoothed_name] = {
+            'original_factor': original_name,
+            'window': window,
+            'method': method
+        }
+        
+        return smoothed_name
     
     def get_factor_info(self, frequency: Optional[FactorFrequency] = None) -> pd.DataFrame:
         """
@@ -77,12 +138,19 @@ class FactorRegistry:
             if frequency and info['frequency'].value != frequency.value:
                 continue
                 
+            # 添加平滑信息(如果是平滑因子)
+            smoothing_info = ""
+            if 'smoothing_info' in info:
+                smooth_data = info['smoothing_info']
+                smoothing_info = f"平滑自: {smooth_data['original_factor']}, 窗口: {smooth_data['window']}, 方法: {smooth_data['method']}"
+                
             records.append({
                 'name': name,
                 'frequency': info['frequency'].value,
                 'category': info['category'],
                 'description': info['description'],
-                'dependencies': ', '.join(info['dependencies'] or [])
+                'dependencies': ', '.join(info['dependencies'] or []),
+                'smoothing_info': smoothing_info
             })
         return pd.DataFrame(records)
     
@@ -190,7 +258,34 @@ class FactorManager:
                     
                     print(f"\n计算因子: {name}")
                     info = FactorManager.registry.factors[name]
-                    result = info['function'](result)
+                    
+                    # 检查是否是平滑因子
+                    if info['frequency'] == FactorFrequency.SMOOTHED and 'smoothing_info' in info:
+                        smooth_info = info['smoothing_info']
+                        original_factor = smooth_info['original_factor']
+                        window = smooth_info['window']
+                        method = smooth_info['method']
+                        
+                        # 确保原始因子已计算
+                        if original_factor not in result.columns:
+                            raise ValueError(f"原始因子 '{original_factor}' 尚未计算")
+                        
+                        # 应用平滑
+                        if method == 'sma':
+                            result[name] = result.groupby('InstruID')[original_factor].transform(
+                                lambda x: x.rolling(window=window, min_periods=1).mean()
+                            )
+                        elif method == 'ema':
+                            result[name] = result.groupby('InstruID')[original_factor].transform(
+                                lambda x: x.ewm(span=window, min_periods=1).mean()
+                            )
+                        else:
+                            raise ValueError(f"不支持的平滑方法: {method}")
+                    else:
+                        # 常规因子计算
+                        if info['function'] is not None:
+                            result = info['function'](result)
+                    
                     calculated.add(name)
             
             print(f"\n因子计算完成!")
@@ -202,6 +297,20 @@ class FactorManager:
             print(f"错误信息: {str(e)}")
             raise
     
+    @staticmethod
+    def register_smoothed_factor(original_name: str, window: int, method: str = 'sma') -> str:
+        """
+        注册平滑因子
+        
+        Args:
+            original_name: 原始因子名称
+            window: 平滑窗口大小
+            method: 平滑方法，'sma'=简单移动平均，'ema'=指数移动平均
+            
+        Returns:
+            平滑因子名称
+        """
+        return FactorManager.registry.register_smoothed_factor(original_name, window, method)
 
 def register_example_factors():
     """注册示例因子"""
