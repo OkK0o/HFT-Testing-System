@@ -4,7 +4,7 @@ import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy import stats
-from scipy.stats import spearmanr  # 明确导入spearmanr函数
+from scipy.stats import spearmanr, pearsonr  # 明确导入pearsonr函数
 import matplotlib.pyplot as plt
 import seaborn as sns
 from skopt import BayesSearchCV
@@ -929,11 +929,12 @@ def train_xgboost_with_bayesian(df,
     # 添加预测与实际值相关性分析
     print(f"预测与实际值相关性:")
     try:
-        print(f"  - 皮尔逊相关系数: {stats.pearsonr(all_predictions[valid_mask].values, valid_returns.values)[0]:.6f}")
-        print(f"  - 斯皮尔曼相关系数: {stats.spearmanr(all_predictions[valid_mask].values, valid_returns.values)[0]:.6f}")
+        valid_mask = ~(all_predictions.isna() | valid_returns.isna())
+        if np.sum(valid_mask) > 0:
+            corr = pearsonr(all_predictions[valid_mask].values, valid_returns.values)[0]
+            print(f"  - 皮尔逊相关系数: {corr:.6f}")
     except Exception as e:
         print(f"  - 计算相关系数时出错: {str(e)}")
-        traceback.print_exc()
     
     # 计算并可视化平均特征重要性
     try:
@@ -1272,6 +1273,66 @@ def train_xgboost_with_bayesian(df,
     }
     
     return results
+
+def plot_feature_importance(importance_df, output_dir):
+    """绘制特征重要性图"""
+    try:
+        plt.figure(figsize=(12, 8))
+        # 只使用前20个特征
+        top_features = importance_df.head(20)
+        
+        # 创建条形图
+        bars = plt.barh(range(len(top_features)), 
+                       top_features['importance_mean'],
+                       xerr=top_features['importance_std'],
+                       capsize=5)
+        
+        # 设置y轴标签
+        plt.yticks(range(len(top_features)), top_features['feature'])
+        
+        # 添加数值标签
+        for i, bar in enumerate(bars):
+            width = bar.get_width()
+            plt.text(width, bar.get_y() + bar.get_height()/2,
+                    f'{width:.4f}',
+                    va='center', ha='left')
+        
+        plt.title('Top 20 Feature Importance')
+        plt.xlabel('Importance')
+        plt.tight_layout()
+        
+        # 保存图片
+        plt.savefig(os.path.join(output_dir, 'avg_feature_importance.png'))
+        plt.close()
+        
+    except Exception as e:
+        print(f"生成特征重要性可视化时出错: {str(e)}")
+        traceback.print_exc()
+
+def plot_quantile_returns(pred_df, output_dir):
+    """绘制分位数收益分析图"""
+    try:
+        # 使用duplicates参数处理重复值
+        pred_df['quantile'] = pd.qcut(pred_df['pred'], 10, labels=False, duplicates='drop')
+        
+        # 计算每个分位数的平均收益
+        quantile_returns = pred_df.groupby('quantile')['actual'].mean()
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(quantile_returns)), quantile_returns.values, 'o-')
+        plt.title('Average Returns by Prediction Quantile')
+        plt.xlabel('Prediction Quantile')
+        plt.ylabel('Average Return')
+        plt.grid(True)
+        
+        # 保存图片
+        plt.savefig(os.path.join(output_dir, 'quantile_returns.png'))
+        plt.close()
+        
+    except Exception as e:
+        print(f"生成预测分位数收益分析图时出错: {str(e)}")
+        traceback.print_exc()
+
 if __name__ == "__main__":
     # 加载因子调整后的数据
     print("加载数据...")

@@ -34,15 +34,24 @@ class FactorsTester:
     """因子测试类"""
     def __init__(self, 
                  save_path: str,
+                 data_path: str = None,
+                 start_date: str = None,
+                 end_date: str = None,
                  config: Optional[FactorTestConfig] = None):
         """
         初始化因子测试器
         
         Args:
             save_path: 结果保存路径
+            data_path: 数据文件路径，用于加载合约数据
+            start_date: 开始日期，格式：YYYY-MM-DD
+            end_date: 结束日期，格式：YYYY-MM-DD
             config: 测试配置，如果为None则使用默认配置
         """
         self.save_path = save_path
+        self.data_path = data_path
+        self.start_date = start_date
+        self.end_date = end_date
         self.config = config or FactorTestConfig()
         
         if not os.path.exists(save_path):
@@ -184,7 +193,7 @@ class FactorsTester:
             if not os.path.exists(file_path):
                 return None
             
-            df = pd.read_feather(file_path)
+            df = self.read_feather_in_chunks(file_path)
             
             df['TradDay'] = pd.to_datetime(df['TradDay'].astype(str))
             mask = (df['TradDay'] >= pd.to_datetime(self.start_date)) & \
@@ -229,10 +238,280 @@ class FactorsTester:
         return result
     
     @staticmethod
+    def calculate_returns_in_chunks(df: pd.DataFrame,
+                                  periods: List[int],
+                                  chunk_size: int = 500000,
+                                  overlap_size: int = 100000,
+                                  price_col: str = 'mid_price') -> pd.DataFrame:
+        """
+        分块计算收益率，用于处理大规模数据
+        
+        Args:
+            df: 输入的DataFrame数据
+            periods: 收益率计算周期列表，如[1, 5, 10, 20]
+            chunk_size: 每块数据的大小
+            overlap_size: 块之间的重叠区域大小
+            price_col: 价格列名，默认使用中间价
+            
+        Returns:
+            添加了收益率列的DataFrame
+        """
+        try:
+            # 检查输入数据
+            if df is None or df.empty:
+                raise ValueError("输入数据为空")
+            
+            print(f"数据集列名: {df.columns.tolist()}")
+            
+            if not isinstance(periods, list):
+                raise TypeError("periods必须是列表类型")
+            
+            if not all(isinstance(p, int) and p > 0 for p in periods):
+                raise ValueError("periods中的所有值必须是正整数")
+            
+            if chunk_size <= 0:
+                raise ValueError("chunk_size必须大于0")
+            
+            if overlap_size < 0:
+                raise ValueError("overlap_size不能为负数")
+            
+            if overlap_size >= chunk_size:
+                raise ValueError("overlap_size不能大于等于chunk_size")
+            
+            # 检查InstruID列是否存在
+            if 'InstruID' not in df.columns:
+                print("警告: 数据中不存在'InstruID'列，尝试寻找替代列")
+                # 尝试查找可能的替代列
+                possible_alternatives = ['instru_id', 'instrumentid', 'instrument_id', 'symbol', 'code']
+                found = False
+                for alt in possible_alternatives:
+                    if alt in df.columns:
+                        print(f"使用'{alt}'列替代'InstruID'")
+                        df['InstruID'] = df[alt]
+                        found = True
+                        break
+                if not found:
+                    raise ValueError("数据中缺少必要的'InstruID'列且找不到替代列")
+            
+            # 计算或验证价格列
+            if price_col not in df.columns:
+                print(f"警告: 数据中不存在'{price_col}'列，尝试计算或查找替代列")
+                
+                # 如果是mid_price但不存在，尝试计算
+                if price_col == 'mid_price':
+                    if 'AskPrice1' in df.columns and 'BidPrice1' in df.columns:
+                        print("计算中间价 (mid_price)")
+                        df['mid_price'] = np.where(
+                            (df['AskPrice1'] == 0) & (df['BidPrice1'] == 0),
+                            np.nan,
+                            np.where(
+                                (df['AskPrice1'] == 0) & (df['BidPrice1'] != 0),
+                                df['BidPrice1'],
+                                np.where(
+                                    (df['BidPrice1'] == 0) & (df['AskPrice1'] != 0),
+                                    df['AskPrice1'],
+                                    (df['AskPrice1'] + df['BidPrice1']) / 2
+                                )
+                            )
+                        )
+                    else:
+                        # 尝试查找可能的价格替代列
+                        price_alternatives = ['LastPrice', 'ClosePrice', 'close', 'Close', 'Price', 'price', 'VWAP', 'vwap']
+                        found = False
+                        for alt in price_alternatives:
+                            if alt in df.columns:
+                                print(f"使用'{alt}'列替代'{price_col}'")
+                                df[price_col] = df[alt]
+                                found = True
+                                break
+                        if not found:
+                            raise ValueError(f"数据中缺少必要的价格列'{price_col}'且找不到替代列")
+                else:
+                    raise ValueError(f"数据中缺少指定的价格列'{price_col}'")
+            
+            # 检查时间列是否存在
+            time_col = None
+            for col in ['DateTime', 'TradDay', 'date', 'Date', 'Time', 'time', 'timestamp', 'Timestamp']:
+                if col in df.columns:
+                    time_col = col
+                    break
+            
+            if time_col is None:
+                raise ValueError("数据中缺少时间列，需要DateTime、TradDay或date类似的列")
+            
+            print(f"使用'{time_col}'列作为时间列")
+            
+            # 确保数据按时间排序
+            print(f"按['{time_col}', 'InstruID']排序数据")
+            df = df.sort_values([time_col, 'InstruID'])
+            
+            # 获取数据集大小
+            total_rows = len(df)
+            if total_rows == 0:
+                raise ValueError("排序后的数据为空")
+            
+            print(f"数据集总行数: {total_rows}")
+            print(f"分块大小: {chunk_size}, 重叠区域: {overlap_size}")
+            
+            # 计算需要处理的块数
+            num_chunks = (total_rows - overlap_size) // (chunk_size - overlap_size)
+            if (total_rows - overlap_size) % (chunk_size - overlap_size) > 0:
+                num_chunks += 1
+            
+            if num_chunks == 0:
+                raise ValueError("数据量太小，无法进行分块处理")
+            
+            print(f"需要处理的块数: {num_chunks}")
+            
+            # 初始化结果DataFrame
+            result_df = df.copy()
+            
+            # 按块处理数据
+            for chunk_idx in range(num_chunks):
+                try:
+                    print(f"\n处理第 {chunk_idx + 1}/{num_chunks} 块数据")
+                    
+                    # 计算当前块的起始索引和结束索引
+                    start_idx = chunk_idx * (chunk_size - overlap_size)
+                    end_idx = min(start_idx + chunk_size, total_rows)
+                    
+                    # 对第一个块，始终从0开始
+                    if chunk_idx == 0:
+                        start_idx = 0
+                    
+                    # 提取当前块的数据
+                    chunk_df = df.iloc[start_idx:end_idx].copy()
+                    
+                    if chunk_df.empty:
+                        print(f"警告：第 {chunk_idx + 1} 块数据为空，跳过")
+                        continue
+                    
+                    # 计算中间价（如果不存在）
+                    if price_col == 'mid_price' and ('mid_price' not in chunk_df.columns or chunk_df['mid_price'].isna().all()):
+                        if 'AskPrice1' in chunk_df.columns and 'BidPrice1' in chunk_df.columns:
+                            print(f"在块 {chunk_idx + 1} 中计算中间价")
+                            chunk_df['mid_price'] = np.where(
+                                (chunk_df['AskPrice1'] == 0) & (chunk_df['BidPrice1'] == 0),
+                                np.nan,
+                                np.where(
+                                    (chunk_df['AskPrice1'] == 0) & (chunk_df['BidPrice1'] != 0),
+                                    chunk_df['BidPrice1'],
+                                    np.where(
+                                        (chunk_df['BidPrice1'] == 0) & (chunk_df['AskPrice1'] != 0),
+                                        chunk_df['AskPrice1'],
+                                        (chunk_df['AskPrice1'] + chunk_df['BidPrice1']) / 2
+                                    )
+                                )
+                            )
+                            chunk_df['mid_price'] = chunk_df.groupby('InstruID')['mid_price'].fillna(method='ffill')
+                    
+                    # 检查价格列是否有效
+                    if chunk_df[price_col].isna().all():
+                        print(f"警告：第 {chunk_idx + 1} 块的价格列全为空值")
+                        continue
+                    
+                    # 打印一些价格统计信息，帮助调试
+                    price_stats = chunk_df[price_col].describe()
+                    print(f"价格列'{price_col}'统计信息:\n{price_stats}")
+                    
+                    # 计算每个周期的收益率
+                    for period in periods:
+                        try:
+                            print(f"计算 {period} 周期收益率...")
+                            col_name = f'{period}period_return'
+                            chunk_df[col_name] = chunk_df.groupby('InstruID')[price_col].transform(
+                                lambda x: x.pct_change(period).shift(-period)
+                            )
+                            
+                            # 检查收益率计算结果
+                            non_na_count = chunk_df[col_name].notna().sum()
+                            total_count = len(chunk_df)
+                            print(f"{col_name} 非空值比例: {non_na_count}/{total_count} ({100 * non_na_count / total_count:.2f}%)")
+                            
+                            # 检查无穷值
+                            inf_count = np.isinf(chunk_df[col_name]).sum()
+                            if inf_count > 0:
+                                print(f"警告: {col_name} 中存在 {inf_count} 个无穷值，将替换为NaN")
+                                chunk_df[col_name] = chunk_df[col_name].replace([np.inf, -np.inf], np.nan)
+                            
+                            # 检查极端值
+                            return_stats = chunk_df[col_name].describe(percentiles=[0.01, 0.05, 0.95, 0.99])
+                            print(f"{col_name} 统计信息:\n{return_stats}")
+                            
+                        except Exception as e:
+                            print(f"计算 {period} 周期收益率时出错: {str(e)}")
+                            print("尝试替代方法计算收益率...")
+                            
+                            try:
+                                # 替代方法：不使用transform
+                                returns = pd.Series(index=chunk_df.index)
+                                for instru, group in chunk_df.groupby('InstruID'):
+                                    if len(group) > period:
+                                        group_returns = group[price_col].pct_change(period).shift(-period)
+                                        returns.loc[group.index] = group_returns
+                                chunk_df[col_name] = returns
+                                print(f"替代方法计算 {period} 周期收益率成功")
+                            except Exception as e2:
+                                print(f"替代方法计算 {period} 周期收益率也失败: {str(e2)}")
+                                # 创建空列，避免后续错误
+                                chunk_df[col_name] = np.nan
+                    
+                    # 更新结果DataFrame
+                    result_df.iloc[start_idx:end_idx] = chunk_df
+                    
+                    # 释放内存
+                    del chunk_df
+                    import gc
+                    gc.collect()
+                    print(f"第 {chunk_idx + 1} 块处理完成，已释放内存")
+                    
+                except Exception as e:
+                    print(f"处理第 {chunk_idx + 1} 块时出错: {str(e)}")
+                    print("继续处理下一块...")
+                    continue
+            
+            # 检查结果
+            if result_df.empty:
+                raise ValueError("处理后的数据为空")
+            
+            # 检查收益率列是否成功计算
+            success_count = 0
+            for period in periods:
+                col_name = f'{period}period_return'
+                if col_name not in result_df.columns:
+                    print(f"警告：未能创建 {period} 周期收益率列")
+                    continue
+                
+                if result_df[col_name].isna().all():
+                    print(f"警告：{period} 周期收益率全为空值")
+                    continue
+                
+                non_na_count = result_df[col_name].notna().sum()
+                total_count = len(result_df)
+                print(f"{col_name} 非空值比例: {non_na_count}/{total_count} ({100 * non_na_count / total_count:.2f}%)")
+                
+                if non_na_count > 0:
+                    success_count += 1
+            
+            if success_count == 0:
+                print("警告：所有周期的收益率计算均失败")
+            else:
+                print(f"成功计算了 {success_count}/{len(periods)} 个周期的收益率")
+            
+            return result_df
+            
+        except Exception as e:
+            print(f"计算收益率时出错: {str(e)}")
+            print("\n错误详情:")
+            import traceback
+            print(traceback.format_exc())
+            raise
+    
+    @staticmethod
     def calculate_ic(df: pd.DataFrame,
                     factor_names: Union[str, List[str]],
                     return_periods: List[int] = [1, 5, 10, 20],
-                    method: str = 'pearson',
+                    method: str = 'spearman',
                     min_sample: int = 30) -> pd.DataFrame:
         """
         计算因子IC值
@@ -291,7 +570,7 @@ class FactorsTester:
     def calculate_ic_series(df: pd.DataFrame,
                            factor_names: Union[str, List[str]],
                            return_periods: List[int] = [1, 5, 10, 20],
-                           method: str = 'pearson',
+                           method: str = 'spearman',
                            min_sample: int = 30) -> Dict[str, pd.DataFrame]:
         """
         计算因子IC值的时间序列
@@ -864,6 +1143,96 @@ class FactorsTester:
         print("\n评估意见:")
         for comment in eval_result['comments']:
             print(f"- {comment}")
+
+    @staticmethod
+    def read_feather_in_chunks(file_path: str, chunk_size: int = 100000) -> pd.DataFrame:
+        """
+        分块读取feather文件，解决内存问题
+        
+        Args:
+            file_path: feather文件路径
+            chunk_size: 每次读取的行数
+            
+        Returns:
+            完整的DataFrame
+        """
+        try:
+            import pyarrow as pa
+            from pyarrow import feather
+            import gc
+            
+            # 使用memory map读取文件
+            print(f"开始分块读取文件: {file_path}")
+            try:
+                reader = pa.ipc.open_file(pa.memory_map(file_path, 'r'))
+            except Exception as e:
+                print(f"使用memory_map打开文件失败: {str(e)}")
+                print("尝试使用pyarrow.feather读取文件头获取元数据...")
+                
+                # 只读取文件元数据，不加载数据
+                reader = feather.FeatherReader(file_path)
+                num_rows = reader.num_rows
+                print(f"文件包含 {num_rows} 行")
+                
+                # 分块读取
+                result_chunks = []
+                for i in range(0, num_rows, chunk_size):
+                    print(f"读取行 {i} 到 {min(i + chunk_size, num_rows)}")
+                    chunk = pd.read_feather(file_path, nthreads=1, use_threads=False, 
+                                          memory_map=False, columns=None, 
+                                          offset=i, num_rows=min(chunk_size, num_rows - i))
+                    result_chunks.append(chunk)
+                    
+                    # 强制垃圾回收
+                    gc.collect()
+                
+                result = pd.concat(result_chunks, ignore_index=True)
+                return result
+            
+            # 获取批次数量
+            num_batches = reader.num_record_batches
+            print(f"文件包含 {num_batches} 个批次")
+            
+            # 分批读取
+            result_chunks = []
+            total_rows = 0
+            
+            for i in range(num_batches):
+                try:
+                    print(f"读取批次 {i+1}/{num_batches}")
+                    batch = reader.get_batch(i)
+                    chunk_df = batch.to_pandas()
+                    total_rows += len(chunk_df)
+                    result_chunks.append(chunk_df)
+                    
+                    # 强制垃圾回收
+                    del batch
+                    gc.collect()
+                    
+                except Exception as e:
+                    print(f"读取批次 {i} 时出错: {str(e)}")
+                    continue
+            
+            if not result_chunks:
+                raise ValueError("无法读取任何数据")
+            
+            print(f"成功读取 {total_rows} 行数据")
+            
+            # 合并所有分块
+            result = pd.concat(result_chunks, ignore_index=True)
+            
+            # 清理内存
+            del result_chunks
+            gc.collect()
+            
+            return result
+            
+        except Exception as e:
+            print(f"读取文件时出错: {str(e)}")
+            print("\n错误详情:")
+            import traceback
+            print(traceback.format_exc())
+            raise
 
 
 

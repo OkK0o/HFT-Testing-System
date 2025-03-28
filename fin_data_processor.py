@@ -34,10 +34,16 @@ class FinDataProcessor:
         df = pd.read_feather(file_path)
         
         # 转换日期时间
-        df['TradDay'] = pd.to_datetime(df['TradDay'].astype(str))
-        df['DateTime'] = pd.to_datetime(
-            df['TradDay'].dt.strftime('%Y-%m-%d') + ' ' + df['UpdateTime']
-        )
+        if 'TradDay' in df.columns and 'DateTime' not in df.columns:
+            # 确保TradDay是datetime类型
+            if not pd.api.types.is_datetime64_dtype(df['TradDay']):
+                df['TradDay'] = pd.to_datetime(df['TradDay'].astype(str))
+            
+            # 如果有UpdateTime列，创建DateTime列
+            if 'UpdateTime' in df.columns:
+                df['DateTime'] = pd.to_datetime(
+                    df['TradDay'].dt.strftime('%Y-%m-%d') + ' ' + df['UpdateTime'].astype(str)
+                )
         
         return df
     
@@ -119,8 +125,15 @@ class FinDataProcessor:
         # 1. 处理重复数据
         df = df.drop_duplicates()
         
-        # 2. 按时间和合约排序
-        df = df.sort_values(['DateTime', 'InstruID'])
+        # 2. 按时间和合约排序 (兼容不同的列结构)
+        if 'DateTime' in df.columns:
+            df = df.sort_values(['DateTime', 'InstruID'])
+        elif 'TradDay' in df.columns and 'UpdateTime' in df.columns:
+            df = df.sort_values(['TradDay', 'UpdateTime', 'InstruID'])
+        elif 'date' in df.columns:
+            df = df.sort_values(['date', 'InstruID'])
+        else:
+            warnings.warn("无法找到时间相关列进行排序")
         
         # 3. 处理缺失值
         # 如果指定了列名就使用指定的列,否则使用所有数值型列
@@ -132,13 +145,19 @@ class FinDataProcessor:
         if fill_method == 'drop':
             df = df.dropna(subset=numeric_cols)
         elif fill_method == 'ffill':
-            df[numeric_cols] = df.groupby('InstruID')[numeric_cols].fillna(method='ffill')
+            df[numeric_cols] = df.groupby('InstruID')[numeric_cols].ffill()
         elif fill_method == 'bfill':
             df[numeric_cols] = df.groupby('InstruID')[numeric_cols].fillna(method='bfill')
         elif fill_method == 'interpolate':
-            df[numeric_cols] = df.groupby('InstruID')[numeric_cols].apply(
-                lambda x: x.interpolate(method='time')
-            )
+            # 如果有DateTime列则按时间插值，否则按索引
+            if 'DateTime' in df.columns:
+                df[numeric_cols] = df.groupby('InstruID')[numeric_cols].apply(
+                    lambda x: x.interpolate(method='time')
+                )
+            else:
+                df[numeric_cols] = df.groupby('InstruID')[numeric_cols].apply(
+                    lambda x: x.interpolate(method='index')
+                )
         
         # 4. 处理异常值（如果需要）
         if handle_outliers:
@@ -165,6 +184,7 @@ class FinDataProcessor:
                     df[col] = df.groupby('InstruID')[col].fillna(method='ffill')
         
         return df
+    
     def add_features(self, 
                     df: pd.DataFrame,
                     features: List[str] = None) -> pd.DataFrame:
@@ -230,12 +250,74 @@ class FinDataProcessor:
             elif feature == 'spread':
                 # 计算买卖价差
                 df['spread'] = df['AskPrice1'] - df['BidPrice1']
-                
+            
             elif feature == 'depth_imbalance':
                 # 计算盘口深度不平衡
                 bid_depth = df['BidVolume1'] + df['BidVolume2'] + df['BidVolume3']
                 ask_depth = df['AskVolume1'] + df['AskVolume2'] + df['AskVolume3']
                 df['depth_imbalance'] = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+                
+        
+        return df
+    
+    def calculate_returns(self,
+                         df: pd.DataFrame,
+                         periods: List[int] = [1, 5, 10, 20],
+                         price_col: str = 'mid_price',
+                         shift_method: str = 'forward',
+                         drop_na: bool = False) -> pd.DataFrame:
+        """
+        计算多个周期的收益率
+        
+        Args:
+            df: 输入DataFrame
+            periods: 收益率周期列表，例如[1, 5, 10, 20]表示计算1期、5期、10期和20期收益率
+            price_col: 用于计算收益率的价格列名
+            shift_method: 'forward'表示未来收益率，'backward'表示历史收益率
+            drop_na: 是否删除含有NaN的行
+            
+        Returns:
+            添加了收益率列的DataFrame
+        """
+        df = df.copy()
+        
+        # 确保有价格列
+        if price_col not in df.columns:
+            if price_col == 'mid_price' and 'AskPrice1' in df.columns and 'BidPrice1' in df.columns:
+                # 如果需要mid_price，但不存在，则计算它
+                df = self.add_features(df, features=['mid_price'])
+            elif 'LastPrice' in df.columns:
+                # 如果指定的价格列不存在，但有LastPrice，则使用LastPrice
+                print(f"警告：价格列 {price_col} 不存在，使用 LastPrice 替代")
+                price_col = 'LastPrice'
+            else:
+                raise ValueError(f"价格列 {price_col} 不存在，且找不到替代列")
+        
+        # 确保数据按时间排序
+        if 'DateTime' in df.columns:
+            df = df.sort_values(['InstruID', 'DateTime'])
+        elif 'TradDay' in df.columns and 'UpdateTime' in df.columns:
+            df = df.sort_values(['InstruID', 'TradDay', 'UpdateTime'])
+        elif 'date' in df.columns:
+            df = df.sort_values(['InstruID', 'date'])
+        
+        # 计算各周期收益率
+        for period in periods:
+            if shift_method == 'forward':
+                # 计算未来收益率
+                df[f'{period}period_return'] = df.groupby('InstruID')[price_col].transform(
+                    lambda x: x.pct_change(periods=period).shift(-period)
+                )
+            else:
+                # 计算历史收益率
+                df[f'{period}period_return'] = df.groupby('InstruID')[price_col].transform(
+                    lambda x: x.pct_change(periods=period)
+                )
+        
+        # 删除含有NaN的行（如果需要）
+        if drop_na:
+            return_cols = [f'{period}period_return' for period in periods]
+            df = df.dropna(subset=return_cols)
         
         return df
     
@@ -252,53 +334,137 @@ class FinDataProcessor:
         df = df.copy()
         
         # 添加时间特征
-        df['hour'] = df['DateTime'].dt.hour
-        df['minute'] = df['DateTime'].dt.minute
-        df['second'] = df['DateTime'].dt.second
-        df['day_of_week'] = df['DateTime'].dt.dayofweek
+        # 确保有DateTime列
+        if 'DateTime' not in df.columns and 'TradDay' in df.columns and 'UpdateTime' in df.columns:
+            # 首先确保TradDay是日期时间类型
+            if not pd.api.types.is_datetime64_dtype(df['TradDay']):
+                # 如果TradDay是整数类型，需要转换成字符串格式再转换为日期时间
+                if pd.api.types.is_integer_dtype(df['TradDay']):
+                    df['TradDay'] = pd.to_datetime(df['TradDay'].astype(str), format='%Y%m%d')
+                else:
+                    # 尝试直接转换
+                    df['TradDay'] = pd.to_datetime(df['TradDay'])
+            
+            # 然后处理UpdateTime，确保它是字符串类型
+            update_time_str = df['UpdateTime'].astype(str)
+            
+            # 现在可以安全地使用.dt访问器
+            df['DateTime'] = pd.to_datetime(
+                df['TradDay'].dt.strftime('%Y-%m-%d') + ' ' + update_time_str
+            )
+        elif 'date' in df.columns and 'DateTime' not in df.columns:
+            # 如果已经有date列但没有DateTime列，可以直接使用
+            if not pd.api.types.is_datetime64_dtype(df['date']):
+                df['date'] = pd.to_datetime(df['date'])
+            df['DateTime'] = df['date']
+        
+        # 从DateTime或TradDay提取时间特征
+        if 'DateTime' in df.columns:
+            df['hour'] = df['DateTime'].dt.hour
+            df['minute'] = df['DateTime'].dt.minute
+            df['second'] = df['DateTime'].dt.second
+            df['day_of_week'] = df['DateTime'].dt.dayofweek
+        elif 'TradDay' in df.columns:
+            # 确保TradDay是日期时间类型
+            if not pd.api.types.is_datetime64_dtype(df['TradDay']):
+                if pd.api.types.is_integer_dtype(df['TradDay']):
+                    df['TradDay'] = pd.to_datetime(df['TradDay'].astype(str), format='%Y%m%d')
+                else:
+                    df['TradDay'] = pd.to_datetime(df['TradDay'])
+            
+            df['day_of_week'] = df['TradDay'].dt.dayofweek
+            
+            # 从UpdateTime提取时间信息
+            if 'UpdateTime' in df.columns:
+                # 尝试从UpdateTime字符串提取小时、分钟和秒
+                update_time_str = df['UpdateTime'].astype(str)
+                time_parts = update_time_str.str.split('[:.]', expand=True)
+                
+                if not time_parts.empty and time_parts.shape[1] >= 2:
+                    df['hour'] = pd.to_numeric(time_parts[0], errors='coerce')
+                    df['minute'] = pd.to_numeric(time_parts[1], errors='coerce')
+                    if time_parts.shape[1] >= 3:
+                        df['second'] = pd.to_numeric(time_parts[2], errors='coerce')
         
         # 标记交易时段
-        df['session'] = 'other'
-        morning_mask = ((df['hour'] == 9) & (df['minute'] >= 30)) | \
-                      ((df['hour'] == 10)) | \
-                      ((df['hour'] == 11) & (df['minute'] <= 30))
-        afternoon_mask = ((df['hour'] >= 13) & (df['hour'] < 15)) | \
-                        ((df['hour'] == 15) & (df['minute'] <= 15))
-        df.loc[morning_mask, 'session'] = 'morning'
-        df.loc[afternoon_mask, 'session'] = 'afternoon'
+        if 'hour' in df.columns and 'minute' in df.columns:
+            df['session'] = 'other'
+            morning_mask = ((df['hour'] == 9) & (df['minute'] >= 30)) | \
+                          ((df['hour'] == 10)) | \
+                          ((df['hour'] == 11) & (df['minute'] <= 30))
+            afternoon_mask = ((df['hour'] >= 13) & (df['hour'] < 15)) | \
+                            ((df['hour'] == 15) & (df['minute'] <= 15))
+            df.loc[morning_mask, 'session'] = 'morning'
+            df.loc[afternoon_mask, 'session'] = 'afternoon'
         
         # 标记节假日
-        df['is_holiday'] = df['TradDay'].apply(
-            lambda x: is_holiday(x.date())
-        )
+        if 'TradDay' in df.columns:
+            # 确保TradDay是日期时间类型
+            if not pd.api.types.is_datetime64_dtype(df['TradDay']):
+                df['TradDay'] = pd.to_datetime(df['TradDay'])
+                
+            df['is_holiday'] = df['TradDay'].apply(
+                lambda x: is_holiday(x.date())
+            )
+        elif 'DateTime' in df.columns:
+            df['is_holiday'] = df['DateTime'].apply(
+                lambda x: is_holiday(x.date())
+            )
+        elif 'date' in df.columns:
+            # 确保date是datetime类型
+            if not pd.api.types.is_datetime64_dtype(df['date']):
+                df['date'] = pd.to_datetime(df['date'])
+            df['is_holiday'] = df['date'].apply(
+                lambda x: is_holiday(x.date())
+            )
         
         # 标记是否跨日
-        df['is_overnight'] = df['hour'].isin([0, 1, 2, 3, 4, 5, 6, 7])
+        if 'hour' in df.columns:
+            df['is_overnight'] = df['hour'].isin([0, 1, 2, 3, 4, 5, 6, 7])
         
         # 计算到期天数（针对期货合约）
         def get_expiry_date(instru_id: str) -> datetime.datetime:
             """从合约ID获取到期日期"""
-            if not instru_id.startswith(('IF', 'IH', 'IC')):
+            if not isinstance(instru_id, str) or not instru_id.startswith(('IF', 'IH', 'IC')):
                 return None
             
-            year = int('20' + instru_id[-4:-2])
-            month = int(instru_id[-2:])
-            
-            # 获取该月第三个周五
-            first_day = datetime.datetime(year, month, 1)
-            weekday = first_day.weekday()
-            friday_count = 0
-            day = 1
-            while friday_count < 3:
-                if (weekday + day - 1) % 7 == 4:  # 4 represents Friday
-                    friday_count += 1
-                if friday_count < 3:
-                    day += 1
-            
-            return datetime.datetime(year, month, day)
+            try:
+                year = int('20' + instru_id[-4:-2])
+                month = int(instru_id[-2:])
+                
+                # 获取该月第三个周五
+                first_day = datetime.datetime(year, month, 1)
+                weekday = first_day.weekday()
+                friday_count = 0
+                day = 1
+                while friday_count < 3:
+                    if (weekday + day - 1) % 7 == 4:  # 4 represents Friday
+                        friday_count += 1
+                    if friday_count < 3:
+                        day += 1
+                
+                return datetime.datetime(year, month, day)
+            except (ValueError, IndexError, TypeError):
+                return None
         
         df['expiry_date'] = df['InstruID'].apply(get_expiry_date)
-        df['days_to_expiry'] = (df['expiry_date'] - df['DateTime']).dt.days
+        
+        # 计算到期天数
+        if 'expiry_date' in df.columns:
+            df['expiry_date'] = pd.to_datetime(df['expiry_date'])
+            
+            if 'DateTime' in df.columns:
+                df['days_to_expiry'] = (df['expiry_date'] - df['DateTime']).dt.days
+            elif 'TradDay' in df.columns:
+                # 确保TradDay是日期时间类型
+                if not pd.api.types.is_datetime64_dtype(df['TradDay']):
+                    df['TradDay'] = pd.to_datetime(df['TradDay'])
+                df['days_to_expiry'] = (df['expiry_date'] - df['TradDay']).dt.days
+            elif 'date' in df.columns:
+                # 确保date是日期时间类型
+                if not pd.api.types.is_datetime64_dtype(df['date']):
+                    df['date'] = pd.to_datetime(df['date'])
+                df['days_to_expiry'] = (df['expiry_date'] - df['date']).dt.days
         
         return df
     
@@ -322,6 +488,20 @@ class FinDataProcessor:
             重采样后的DataFrame
         """
         df = df.copy()
+        
+        # 确保有DateTime列用于重采样
+        if 'DateTime' not in df.columns:
+            if 'TradDay' in df.columns and 'UpdateTime' in df.columns:
+                df['DateTime'] = pd.to_datetime(
+                    df['TradDay'].dt.strftime('%Y-%m-%d') + ' ' + df['UpdateTime'].astype(str)
+                )
+            elif 'date' in df.columns:
+                # 如果只有日期没有时间，可能无法进行更细粒度的重采样
+                if isinstance(df['date'].iloc[0], str):
+                    df['DateTime'] = pd.to_datetime(df['date'])
+                else:
+                    df['DateTime'] = df['date']
+                warnings.warn("仅有日期信息，无法进行高频重采样，结果可能不准确")
         
         # 如果没有中间价，先计算中间价
         if price_col == 'mid_price' and 'mid_price' not in df.columns:
