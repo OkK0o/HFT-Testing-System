@@ -20,6 +20,7 @@ def run_factor_compute(df: pd.DataFrame,
                       adjust_sign: bool = True) -> Dict:
     """
     运行因子测试
+    所有因子（包括分钟级别的）都直接在原始数据上计算，不进行重采样
     
     Args:
         df: 输入的DataFrame数据
@@ -61,19 +62,15 @@ def run_factor_compute(df: pd.DataFrame,
         print(f"\n原始数据形状: {data.shape}")
         
         try:
-            if factor_freq == FactorFrequency.TICK:
-                factor_df = FactorManager.calculate_factors(df, frequency=FactorFrequency.TICK, factor_names=factor_name)
-                if factor_name in factor_df.columns:
-                    data[factor_name] = factor_df[factor_name]
+            # 所有因子都直接在原始数据上计算，无论频率
+            # 但保留频率信息以便让FactorManager知道要计算的是哪种类型的因子
+            factor_df = FactorManager.calculate_factors(df, frequency=factor_freq, factor_names=factor_name)
+            
+            if factor_name in factor_df.columns:
+                data[factor_name] = factor_df[factor_name].values
+                print(f"因子 {factor_name} 计算完成")
             else:
-                data_processor = FinDataProcessor("data")
-                minute_df = data_processor.resample_data(df, freq='1min')
-                minute_df['TradDay'] = minute_df['DateTime'].dt.date
-                factor_df = FactorManager.calculate_factors(minute_df, frequency=FactorFrequency.MINUTE, factor_names=factor_name)
-                if factor_name in factor_df.columns:
-                    data = data.merge(factor_df[['DateTime', factor_name]], 
-                                    on='DateTime', 
-                                    how='left')
+                print(f"警告: 因子 {factor_name} 未被成功计算")
             
             print(f"\n添加因子后数据形状: {data.shape}")
             data = FactorsTester.calculate_forward_returns(data, periods=periods)
@@ -147,6 +144,7 @@ def compute_factor(df: pd.DataFrame,
                    factor_name: str) -> pd.DataFrame:
     """
     仅计算因子，不进行测试，并将因子值添加回原始数据
+    不再区分tick级别和分钟级别因子，所有因子都直接在原始数据上计算
     
     Args:
         df: 输入的DataFrame数据
@@ -162,24 +160,38 @@ def compute_factor(df: pd.DataFrame,
         print("\n可用的因子列表：")
         print(FactorManager.get_factor_info())
         return df
+        
+    # 保存原始列，用于后续验证是否添加了新列
+    original_columns = set(df.columns)
     original_index = df.index.copy()
     result_df = df.copy()
+    
     try:
-        if factor_freq == FactorFrequency.TICK:
-            factor_df = FactorManager.calculate_factors(df, frequency=FactorFrequency.TICK, factor_names=factor_name)
-            if factor_name in factor_df.columns:
-                result_df[factor_name] = factor_df[factor_name]
+        # 所有因子都直接在原始数据上计算，无论频率
+        # 但保留频率信息以便让FactorManager知道要计算的是哪种类型的因子
+        factor_df = FactorManager.calculate_factors(df, frequency=factor_freq, factor_names=factor_name)
+        
+        # 检查因子是否计算成功
+        if factor_name in factor_df.columns:
+            # 直接将因子列赋值给结果DataFrame
+            result_df[factor_name] = factor_df[factor_name].values
+            print(f"因子 {factor_name} 计算完成")
         else:
-            data_processor = FinDataProcessor("data")
-            minute_df = data_processor.resample_data(df, freq='1min')
-            minute_df['TradDay'] = minute_df['DateTime'].dt.date
-            factor_df = FactorManager.calculate_factors(minute_df, frequency=FactorFrequency.MINUTE, factor_names=factor_name)
-            if factor_name in factor_df.columns:
-                result_df = result_df.merge(factor_df[['DateTime', factor_name]], 
-                                          on='DateTime', 
-                                          how='left')
+            print(f"警告: 因子 {factor_name} 未被成功计算")
+        
+        # 恢复原始索引顺序
         result_df = result_df.loc[original_index]
-        print(f"因子 {factor_name} 计算完成")
+        
+        # 验证因子是否成功添加
+        new_columns = set(result_df.columns)
+        added_columns = new_columns - original_columns
+        
+        if factor_name in added_columns:
+            print(f"成功添加因子: {factor_name}")
+        elif factor_name in result_df.columns:
+            print(f"因子列已存在: {factor_name}")
+        else:
+            print(f"警告: 计算后因子 {factor_name} 不在结果DataFrame中")
     except Exception as e:
         print(f"计算因子 {factor_name} 时出错: {str(e)}")
         return df
@@ -188,7 +200,8 @@ def compute_factor(df: pd.DataFrame,
 
 def compute_multiple_factors(df: pd.DataFrame, 
                            factor_names: List[str],
-                           adjust_sign: bool = True) -> pd.DataFrame:
+                           adjust_sign: bool = True,
+                           use_period: int = None) -> pd.DataFrame:
     """
     批量计算多个因子
     
@@ -196,6 +209,7 @@ def compute_multiple_factors(df: pd.DataFrame,
         df: 输入的DataFrame数据
         factor_names: 要计算的因子名称列表
         adjust_sign: 是否根据IC调整因子符号
+        use_period: 使用的return周期，如果提供将使用指定周期的return
         
     Returns:
         添加了所有因子值的原始DataFrame
@@ -203,11 +217,53 @@ def compute_multiple_factors(df: pd.DataFrame,
     result_df = df.copy()
     print(f"\n开始计算 {len(factor_names)} 个因子...")
     
-    # 先计算所有因子
-    for factor_name in factor_names:
-        result_df = compute_factor(result_df, factor_name)
+    # 保存原始列，用于验证
+    original_columns = set(result_df.columns)
     
-    print("\n所有因子计算完成!")
+    # 如果指定了use_period，确保相应的return列存在
+    if use_period is not None:
+        # 检查是否存在指定周期的return列
+        return_col = f'{use_period}period_return'
+        if return_col not in result_df.columns:
+            print(f"警告: 未找到 {return_col} 列，将尝试使用其他可用的return")
+            
+        print(f"使用 {use_period} 周期的收益率计算因子")
+    
+    # 逐个计算因子
+    successful_factors = []
+    failed_factors = []
+    
+    for i, factor_name in enumerate(factor_names):
+        print(f"\n计算因子 {i+1}/{len(factor_names)}: {factor_name}")
+        
+        # 计算单个因子
+        result_df = compute_factor(result_df, factor_name)
+        
+        # 验证因子是否成功添加
+        if factor_name in result_df.columns:
+            successful_factors.append(factor_name)
+            print(f"✓ 因子 {factor_name} 成功添加")
+        else:
+            failed_factors.append(factor_name)
+            print(f"✗ 因子 {factor_name} 添加失败")
+    
+    # 如果需要调整符号
+    if adjust_sign and successful_factors:
+        print("\n调整因子符号...")
+        # 如果指定了使用周期，使用该周期进行调整
+        if use_period is not None:
+            result_df = adjust_factor_signs(result_df, factor_names=successful_factors, return_periods=[use_period])
+        else:
+            result_df = adjust_factor_signs(result_df, factor_names=successful_factors)
+    
+    # 输出计算摘要
+    print(f"\n因子计算完成摘要:")
+    print(f"- 成功计算的因子: {len(successful_factors)}/{len(factor_names)}")
+    print(f"- 失败的因子: {len(failed_factors)}/{len(factor_names)}")
+    
+    if failed_factors:
+        print(f"失败的因子列表: {failed_factors}")
+    
     return result_df
 
 def compute_factors_in_chunks(df: pd.DataFrame, 
@@ -267,8 +323,9 @@ def compute_factors_in_chunks(df: pd.DataFrame,
     # 用于存储每个因子的值
     factor_values = {factor: pd.Series(index=df.index, dtype='float64') for factor in factor_names}
     
-    # 获取因子信息
+    # 获取因子信息和频率
     factor_info = FactorManager.get_factor_info()
+    factor_freqs = {factor: FactorManager.get_factor_frequency(factor) for factor in factor_names}
     
     # 按块处理数据
     for chunk_idx in range(num_chunks):
@@ -286,41 +343,32 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         # 输出处理进度
         print(f"\n处理第 {chunk_idx + 1}/{num_chunks} 块数据 (索引 {start_idx} 到 {end_idx-1}), 大小: {len(chunk_df)} 行")
         
-        # 计算当前块的因子
-        chunk_with_factors = compute_multiple_factors(chunk_df, factor_names, adjust_sign=False)
-        
-        # 如果需要调整符号，在当前块上直接计算和调整
-        if adjust_sign:
+        # 为当前块计算每个因子
+        for factor_name in factor_names:
             try:
-                print(f"调整第 {chunk_idx + 1} 块的因子符号...")
-                # 计算前向收益率
-                test_df = FactorsTester.calculate_forward_returns(chunk_with_factors, periods=return_periods)
+                # 获取因子频率
+                factor_freq = factor_freqs.get(factor_name)
+                if factor_freq is None:
+                    print(f"警告: 因子 {factor_name} 的频率未知，跳过")
+                    continue
                 
-                # 为每个因子计算IC值并调整符号
-                config = FactorTestConfig(return_periods=return_periods)
-                for factor_name in factor_names:
-                    if factor_name in chunk_with_factors.columns:
-                        # 计算IC
-                        ic_df = FactorsTester.calculate_ic(
-                            test_df, 
-                            factor_names=factor_name,
-                            return_periods=return_periods, 
-                            method=config.ic_method
-                        )
-                        
-                        # 获取平均IC
-                        if not ic_df.empty:
-                            ic_col = f'{factor_name}_{return_periods[0]}period_ic'
-                            if ic_col in ic_df.columns:
-                                mean_ic = ic_df[ic_col].mean()
-                                
-                                # 如果IC为负，调整因子符号
-                                if mean_ic < 0:
-                                    chunk_with_factors[factor_name] = -chunk_with_factors[factor_name]
-                                    print(f"  调整因子 {factor_name} 的符号 (块内平均IC: {mean_ic:.4f})")
+                # 直接使用原始数据计算因子
+                factor_df = FactorManager.calculate_factors(chunk_df, frequency=factor_freq, factor_names=factor_name)
+                
+                if factor_name in factor_df.columns:
+                    # 直接将因子值添加到当前块
+                    chunk_df[factor_name] = factor_df[factor_name].values
+                    print(f"因子 {factor_name} 计算完成（块 {chunk_idx + 1}）")
+                else:
+                    print(f"警告: 因子 {factor_name} 未被成功计算（块 {chunk_idx + 1}）")
+                    continue
+                
+                # 释放内存
+                del factor_df
+                gc.collect()
             except Exception as e:
-                print(f"调整第 {chunk_idx + 1} 块因子符号时出错: {str(e)}")
-                print("继续使用未调整的因子值")
+                print(f"计算因子 {factor_name} 时出错 (块 {chunk_idx + 1}): {str(e)}")
+                continue
         
         # 有效数据区域计算：排除头部重叠区域
         valid_start_idx = 0
@@ -335,7 +383,7 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         
         # 提取有效区域的因子值并更新最终结果
         for factor in factor_names:
-            if factor in chunk_with_factors.columns:
+            if factor in chunk_df.columns:
                 # 取当前块的有效区域
                 valid_chunk_indices = chunk_df.index[valid_start_idx:valid_end_idx]
                 original_indices = df.index[start_idx + valid_start_idx:start_idx + valid_end_idx]
@@ -343,10 +391,10 @@ def compute_factors_in_chunks(df: pd.DataFrame,
                 # 将有效区域的因子值赋给最终结果
                 if len(valid_chunk_indices) > 0:
                     # 确保索引匹配
-                    factor_values[factor].loc[original_indices] = chunk_with_factors.loc[valid_chunk_indices, factor].values
+                    factor_values[factor].loc[original_indices] = chunk_df.loc[valid_chunk_indices, factor].values
         
         # 释放内存
-        del chunk_df, chunk_with_factors
+        del chunk_df
         gc.collect()
         print(f"第 {chunk_idx + 1} 块处理完成，已释放内存")
     
@@ -355,6 +403,13 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         if not factor_values[factor].isna().all():  # 确保有计算结果
             final_df[factor] = factor_values[factor]
             print(f"因子 {factor} 添加完成，非空值: {factor_values[factor].count()}/{len(factor_values[factor])}")
+        else:
+            print(f"警告: 因子 {factor} 没有有效值")
+    
+    # 如果需要调整符号
+    if adjust_sign:
+        print("\n调整因子符号...")
+        final_df = adjust_factor_signs_in_chunks(final_df, factor_names=factor_names, return_periods=return_periods)
     
     print("\n分块因子计算完成!")
     return final_df
@@ -482,6 +537,9 @@ def compute_factors_by_contract(df: pd.DataFrame,
     # 初始化结果数据框
     result_df = df.copy()
     
+    # 获取因子频率
+    factor_freqs = {factor: FactorManager.get_factor_frequency(factor) for factor in factor_names}
+    
     # 按合约处理数据
     for i, contract in enumerate(contracts):
         print(f"\n处理合约 {i+1}/{len(contracts)}: {contract}")
@@ -489,17 +547,37 @@ def compute_factors_by_contract(df: pd.DataFrame,
         # 提取当前合约的数据
         contract_df = df[df['InstruID'] == contract].copy()
         
-        try:
-            # 计算当前合约的因子
-            contract_with_factors = compute_multiple_factors(contract_df, factor_names, adjust_sign=False)
-            
-            # 将计算结果更新回结果数据框
-            for factor in factor_names:
-                if factor in contract_with_factors.columns:
-                    result_df.loc[contract_df.index, factor] = contract_with_factors[factor].values
-            
-        except Exception as e:
-            print(f"计算合约 {contract} 的因子时出错: {str(e)}")
+        # 为当前合约计算所有因子
+        for factor_name in factor_names:
+            try:
+                # 获取因子频率
+                factor_freq = factor_freqs.get(factor_name)
+                if factor_freq is None:
+                    print(f"警告: 因子 {factor_name} 的频率未知，跳过")
+                    continue
+                
+                print(f"计算因子: {factor_name} (合约: {contract})")
+                
+                # 直接使用原始数据计算因子
+                factor_df = FactorManager.calculate_factors(contract_df, frequency=factor_freq, factor_names=factor_name)
+                
+                if factor_name in factor_df.columns:
+                    # 将因子值添加到合约数据中
+                    contract_df[factor_name] = factor_df[factor_name].values
+                    print(f"因子 {factor_name} 计算完成 (合约: {contract})")
+                else:
+                    print(f"警告: 因子 {factor_name} 未被成功计算 (合约: {contract})")
+                    continue
+                
+                # 将计算结果更新回结果数据框
+                result_df.loc[contract_df.index, factor_name] = contract_df[factor_name].values
+                
+                # 释放内存
+                del factor_df
+                gc.collect()
+            except Exception as e:
+                print(f"计算因子 {factor_name} 时出错 (合约: {contract}): {str(e)}")
+                continue
         
         # 释放内存
         del contract_df

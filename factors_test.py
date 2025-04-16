@@ -198,33 +198,39 @@ class FactorsTester:
             return None
     
     @staticmethod
-    def calculate_forward_returns(df: pd.DataFrame, 
-                                periods: List[int],
-                                price_col: str = 'mid_price',  # 修改默认使用中间价
-                                time_col: str = None) -> pd.DataFrame:
+    def calculate_forward_returns(df, periods=[10], price_col='mid_price', max_value=10.0):
         """
-        计算未来收益率
+        计算前向收益率
         
         Args:
             df: 输入数据
-            periods: 收益率周期列表
+            periods: 收益率计算周期列表
             price_col: 价格列名
-            time_col: 时间列名，如果提供则按时间计算收益率，否则按行数计算
+            max_value: 收益率最大值，用于剪裁异常值
             
         Returns:
-            添加了未来收益率的DataFrame
+            添加了收益率列的DataFrame
         """
         result = df.copy()
         
+        # 确保按时间和合约排序
+        if 'DateTime' in result.columns:
+            result = result.sort_values(['InstruID', 'DateTime'])
+        
         for period in periods:
-            if time_col is not None:
-                result[f'{period}period_return'] = result.groupby('InstruID').apply(
-                    lambda x: x[price_col].shift(-period) / x[price_col] - 1
-                ).reset_index(level=0, drop=True)
-            else:
-                result[f'{period}period_return'] = result.groupby('InstruID')[price_col].transform(
-                    lambda x: x.shift(-period) / x - 1
-                )
+            # 计算前向收益率
+            result[f'{period}period_return'] = result.groupby('InstruID')[price_col].transform(
+                lambda x: x.shift(-period) / x - 1
+            )
+            
+            # 处理无穷大值和异常值
+            # 1. 将inf和-inf替换为NaN
+            result[f'{period}period_return'].replace([np.inf, -np.inf], np.nan, inplace=True)
+            
+            # 2. 将大于max_value的值剪裁到max_value
+            result[f'{period}period_return'] = result[f'{period}period_return'].clip(-max_value, max_value)
+            
+            print(f"计算{period}period_return完成，剪裁范围: [{-max_value}, {max_value}]")
         
         return result
     

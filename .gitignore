@@ -30,6 +30,11 @@ wheels/
 
 # 数据文件
 *.feather
+*.csv
+*.xlsx
+*.xls
+*.pkl
+*.h5
 data/
 data.feather
 
@@ -44,6 +49,7 @@ Icon
 *.log
 logs/
 factor_test_results/
+result*/
 
 # 环境文件
 .env
@@ -221,3 +227,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# 忽略系统文件
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
