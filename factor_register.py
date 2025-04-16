@@ -559,15 +559,447 @@ class FactorRegister:
             result.drop(['momentum', 'liquidity_score'], axis=1, inplace=True)
             return result
 
+    @staticmethod
+    def register_minute_factors():
+        """分钟级别因子 - 使用至少120期历史数据"""
+        minute_windows = [120, 240, 360, 480]  # 2小时、4小时、6小时、8小时对应的数据条数
+        
+        # 1. 分钟级别多周期动量因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_momentum_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟动量因子"
+            )
+            def calculate_minute_momentum(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                # 确保有mid_price列
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                result[f'minute_momentum_{w}'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change(w)
+                )
+                return result
+        
+        # 2. 分钟级别波动率持续性因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_vol_persistence_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="volatility",
+                description=f"{window}分钟波动率持续性因子"
+            )
+            def calculate_minute_vol_persistence(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算收益率
+                result['returns'] = result.groupby('InstruID')['mid_price'].transform(lambda x: x.pct_change())
+                
+                # 计算短期波动率和长期波动率的比值
+                short_window = max(w // 4, 30)  # 短期窗口为长期窗口的1/4，最小30
+                
+                result['short_vol'] = result.groupby('InstruID')['returns'].transform(
+                    lambda x: x.rolling(window=short_window, min_periods=short_window//2).std()
+                )
+                result['long_vol'] = result.groupby('InstruID')['returns'].transform(
+                    lambda x: x.rolling(window=w, min_periods=w//2).std()
+                )
+                
+                result[f'minute_vol_persistence_{w}'] = result['short_vol'] / (result['long_vol'] + 1e-8)
+                
+                # 删除临时列
+                result = result.drop(['returns', 'short_vol', 'long_vol'], axis=1)
+                return result
+        
+        # 3. 分钟级别价格反转因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_reversal_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟价格反转因子"
+            )
+            def calculate_minute_reversal(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算短期和长期收益率
+                short_window = max(w // 6, 20)  # 短期窗口，最小20
+                
+                result['short_return'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change(short_window)
+                )
+                result['long_return'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change(w)
+                )
+                
+                # 反转因子 = 短期收益率 - 长期收益率的一部分
+                result[f'minute_reversal_{w}'] = result['short_return'] - 0.5 * result['long_return']
+                
+                # 删除临时列
+                result = result.drop(['short_return', 'long_return'], axis=1)
+                return result
+        
+        # 4. 分钟级别成交量价格相关性因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_volume_price_corr_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="volume",
+                description=f"{window}分钟成交量价格相关性因子"
+            )
+            def calculate_minute_volume_price_corr(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                result['price_change'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change()
+                )
+                
+                # 计算滚动相关性
+                def rolling_correlation(group):
+                    price_changes = group['price_change']
+                    volumes = group['Volume']
+                    corrs = pd.Series(index=group.index)
+                    
+                    for i in range(len(group)):
+                        if i >= w:
+                            # 使用前w个观测值计算相关性
+                            corr = price_changes.iloc[i-w:i].corr(volumes.iloc[i-w:i])
+                            corrs.iloc[i] = corr
+                    
+                    return corrs
+                
+                # 分组计算相关性
+                result[f'minute_volume_price_corr_{w}'] = result.groupby('InstruID').apply(
+                    rolling_correlation
+                ).reset_index(level=0, drop=True)
+                
+                # 删除临时列
+                result = result.drop(['price_change'], axis=1)
+                return result
+        
+        # 5. 分钟级别价格动量加速度因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_momentum_acceleration_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟动量加速度因子"
+            )
+            def calculate_minute_momentum_acceleration(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算连续两个时间段的动量变化
+                medium_window = w // 2  # 中期窗口
+                
+                result['recent_momentum'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change(medium_window)
+                )
+                result['older_momentum'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.shift(medium_window).pct_change(medium_window)
+                )
+                
+                # 动量加速度 = 近期动量 - 早期动量
+                result[f'minute_momentum_acceleration_{w}'] = result['recent_momentum'] - result['older_momentum']
+                
+                # 删除临时列
+                result = result.drop(['recent_momentum', 'older_momentum'], axis=1)
+                return result
+        
+        # 6. 分钟级别价格趋势强度因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_trend_strength_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟趋势强度因子"
+            )
+            def calculate_minute_trend_strength(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算线性回归斜率
+                def calculate_trend_slope(x):
+                    if len(x) < w//2:
+                        return np.nan
+                    
+                    y = x.values
+                    t = np.arange(len(y))
+                    
+                    # 计算最小二乘线性回归的斜率
+                    slope, _, r_value, _, _ = stats.linregress(t, y)
+                    
+                    # 趋势强度 = 斜率 * R²
+                    trend_strength = slope * (r_value ** 2)
+                    return trend_strength
+                
+                # 计算每个标的的趋势强度
+                result[f'minute_trend_strength_{w}'] = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.rolling(window=w, min_periods=w//2).apply(calculate_trend_slope, raw=False)
+                )
+                
+                return result
 
-def register_all_factors():
+        # 7. 分钟级别RSI因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_rsi_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟相对强弱指标"
+            )
+            def calculate_minute_rsi(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算价格变化
+                delta = result.groupby('InstruID')['mid_price'].transform(lambda x: x.diff())
+                
+                # 计算上涨和下跌
+                gain = delta.where(delta > 0, 0)
+                loss = -delta.where(delta < 0, 0)
+                
+                # 计算平均上涨和下跌
+                avg_gain = gain.rolling(window=w, min_periods=w//2).mean()
+                avg_loss = loss.rolling(window=w, min_periods=w//2).mean()
+                
+                # 计算RSI
+                rs = avg_gain / (avg_loss + 1e-9)
+                result[f'minute_rsi_{w}'] = 100 - (100 / (1 + rs))
+                
+                return result
+        
+        # 8. 分钟级别MACD因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_macd_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟MACD指标"
+            )
+            def calculate_minute_macd(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算EMA
+                ema12 = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.ewm(span=w//2, min_periods=w//4).mean()
+                )
+                ema26 = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.ewm(span=w, min_periods=w//2).mean()
+                )
+                
+                # 计算MACD线和信号线
+                macd_line = ema12 - ema26
+                signal_line = macd_line.ewm(span=w//3, min_periods=w//6).mean()
+                
+                result[f'minute_macd_{w}'] = macd_line - signal_line
+                
+                return result
+        
+        # 9. 分钟级别布林带因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_bollinger_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="volatility",
+                description=f"{window}分钟布林带指标"
+            )
+            def calculate_minute_bollinger(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算中轨和标准差
+                middle_band = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.rolling(window=w, min_periods=w//2).mean()
+                )
+                std = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.rolling(window=w, min_periods=w//2).std()
+                )
+                
+                # 计算布林带宽度
+                result[f'minute_bollinger_{w}'] = (result['mid_price'] - middle_band) / (std + 1e-9)
+                
+                return result
+        
+        # 10. 分钟级别成交量加权价格趋势因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_vwap_trend_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="volume",
+                description=f"{window}分钟成交量加权价格趋势"
+            )
+            def calculate_minute_vwap_trend(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算VWAP
+                vwap = result.groupby('InstruID').apply(
+                    lambda x: (x['mid_price'] * x['Volume']).rolling(window=w, min_periods=w//2).sum() / 
+                            x['Volume'].rolling(window=w, min_periods=w//2).sum()
+                ).reset_index(level=0, drop=True)
+                
+                # 计算VWAP趋势
+                result[f'minute_vwap_trend_{w}'] = (result['mid_price'] - vwap) / (vwap + 1e-9)
+                
+                return result
+        
+        # 11. 分钟级别价格动量背离因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_momentum_divergence_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟价格动量背离指标"
+            )
+            def calculate_minute_momentum_divergence(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算价格动量和动量变化
+                momentum = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change(w//2)
+                )
+                momentum_change = momentum.diff()
+                
+                # 计算价格变化
+                price_change = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change()
+                )
+                
+                # 计算背离
+                result[f'minute_momentum_divergence_{w}'] = np.sign(momentum_change) * np.sign(price_change)
+                
+                return result
+        
+        # 12. 分钟级别价格波动率比率因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_volatility_ratio_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="volatility",
+                description=f"{window}分钟价格波动率比率"
+            )
+            def calculate_minute_volatility_ratio(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算短期和长期波动率
+                short_vol = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.rolling(window=w//4, min_periods=w//8).std()
+                )
+                long_vol = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.rolling(window=w, min_periods=w//2).std()
+                )
+                
+                # 计算波动率比率
+                result[f'minute_volatility_ratio_{w}'] = short_vol / (long_vol + 1e-9)
+                
+                return result
+        
+        # 13. 分钟级别价格趋势加速度因子
+        for window in minute_windows:
+            @FactorManager.registry.register(
+                name=f"minute_trend_acceleration_{window}",
+                frequency=FactorFrequency.MINUTE,
+                category="momentum",
+                description=f"{window}分钟价格趋势加速度"
+            )
+            def calculate_minute_trend_acceleration(df: pd.DataFrame, w=window) -> pd.DataFrame:
+                result = df.copy()
+                if 'mid_price' not in result.columns:
+                    result['mid_price'] = (result['AskPrice1'] + result['BidPrice1']) / 2
+                
+                # 计算价格变化率
+                price_change = result.groupby('InstruID')['mid_price'].transform(
+                    lambda x: x.pct_change()
+                )
+                
+                # 计算加速度
+                result[f'minute_trend_acceleration_{w}'] = price_change.rolling(
+                    window=w//2, min_periods=w//4
+                ).apply(lambda x: np.polyfit(np.arange(len(x)), x, 1)[0])
+                
+                return result
+
+def register_all_factors(register_smoothed=False, smoothing_window=1200):
     """注册所有因子"""
-    register = FactorRegister()
-    register.register_momentum_factors()      # 动量类因子
-    register.register_volatility_factors()    # 波动率类因子
-    register.register_volume_factors()        # 成交量类因子
-    register.register_orderbook_factors()     # 订单簿类因子
-    register.register_microstructure_factors()  # 市场微观结构类因子
-    register.register_time_factors()          # 时间特征类因子
-    register.register_term_structure_factors()  # 期限结构类因子
-    register.register_composite_factors()      # 复合类因子
+    FactorRegister.register_momentum_factors()
+    FactorRegister.register_volatility_factors()
+    FactorRegister.register_volume_factors()
+    FactorRegister.register_orderbook_factors()
+    FactorRegister.register_microstructure_factors()
+    FactorRegister.register_time_factors()
+    FactorRegister.register_term_structure_factors()
+    FactorRegister.register_composite_factors()
+    FactorRegister.register_minute_factors()  # 添加分钟级别因子注册
+    
+    # 注册平滑因子
+    if register_smoothed:
+        factor_names = FactorManager.get_factor_names()
+        register_smoothed_factors(smoothing_window, 'ema', factor_names)
+
+def register_smoothed_factors(window=1200, method='ema', factor_names=None):
+    """
+    为指定的因子创建平滑版本
+    
+    Args:
+        window: 平滑窗口大小，默认1200
+        method: 平滑方法，'ema'或'sma'，默认'ema'
+        factor_names: 要平滑的因子名称列表，如果为None则平滑所有因子
+        
+    Returns:
+        平滑因子名称列表
+    """
+    # 确保先注册所有基础因子
+    register_all_factors()
+    
+    # 获取要平滑的因子列表
+    if factor_names is None:
+        # 如果未指定因子列表，则获取所有已注册的因子
+        all_factors = FactorManager.get_factor_names()
+        # 过滤掉已经是平滑因子的因子
+        original_factors = [f for f in all_factors if '_ema' not in f and '_sma' not in f]
+    else:
+        # 使用指定的因子列表
+        original_factors = [f for f in factor_names if '_ema' not in f and '_sma' not in f]
+    
+    print(f"为{len(original_factors)}个因子创建{method.upper()}{window}平滑版本:")
+    
+    # 为每个因子注册平滑版本
+    smoothed_factors = []
+    for factor in original_factors:
+        try:
+            # 检查因子是否已注册
+            if factor not in FactorManager.get_factor_names():
+                print(f"  - 跳过因子 {factor}: 未注册")
+                continue
+                
+            smoothed_name = FactorManager.register_smoothed_factor(
+                original_name=factor,
+                window=window,
+                method=method
+            )
+            smoothed_factors.append(smoothed_name)
+            print(f"  - 创建平滑因子: {smoothed_name}")
+        except Exception as e:
+            print(f"  - 无法为因子 {factor} 创建平滑版本: {str(e)}")
+    
+    print(f"成功创建{len(smoothed_factors)}个平滑因子")
+    return smoothed_factors

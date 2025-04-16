@@ -5,11 +5,11 @@ from factor_register import register_all_factors
 from fin_data_processor import FinDataProcessor
 from factors_test import FactorsTester, FactorTestConfig
 import pandas as pd
-import datetime
-from typing import List, Dict, Union, Iterator
-import os
 import numpy as np
-from scipy import stats
+import datetime
+from typing import List, Dict, Union, Tuple
+import os
+import gc
 
 def run_factor_compute(df: pd.DataFrame, 
                       factor_name: str = None, 
@@ -20,6 +20,7 @@ def run_factor_compute(df: pd.DataFrame,
                       adjust_sign: bool = True) -> Dict:
     """
     运行因子测试
+    所有因子（包括分钟级别的）都直接在原始数据上计算，不进行重采样
     
     Args:
         df: 输入的DataFrame数据
@@ -61,19 +62,15 @@ def run_factor_compute(df: pd.DataFrame,
         print(f"\n原始数据形状: {data.shape}")
         
         try:
-            if factor_freq == FactorFrequency.TICK:
-                factor_df = FactorManager.calculate_factors(df, frequency=FactorFrequency.TICK, factor_names=factor_name)
-                if factor_name in factor_df.columns:
-                    data[factor_name] = factor_df[factor_name]
+            # 所有因子都直接在原始数据上计算，无论频率
+            # 但保留频率信息以便让FactorManager知道要计算的是哪种类型的因子
+            factor_df = FactorManager.calculate_factors(df, frequency=factor_freq, factor_names=factor_name)
+            
+            if factor_name in factor_df.columns:
+                data[factor_name] = factor_df[factor_name].values
+                print(f"因子 {factor_name} 计算完成")
             else:
-                data_processor = FinDataProcessor("data")
-                minute_df = data_processor.resample_data(df, freq='1min')
-                minute_df['TradDay'] = minute_df['DateTime'].dt.date
-                factor_df = FactorManager.calculate_factors(minute_df, frequency=FactorFrequency.MINUTE, factor_names=factor_name)
-                if factor_name in factor_df.columns:
-                    data = data.merge(factor_df[['DateTime', factor_name]], 
-                                    on='DateTime', 
-                                    how='left')
+                print(f"警告: 因子 {factor_name} 未被成功计算")
             
             print(f"\n添加因子后数据形状: {data.shape}")
             data = FactorsTester.calculate_forward_returns(data, periods=periods)
@@ -147,6 +144,7 @@ def compute_factor(df: pd.DataFrame,
                    factor_name: str) -> pd.DataFrame:
     """
     仅计算因子，不进行测试，并将因子值添加回原始数据
+    不再区分tick级别和分钟级别因子，所有因子都直接在原始数据上计算
     
     Args:
         df: 输入的DataFrame数据
@@ -162,24 +160,38 @@ def compute_factor(df: pd.DataFrame,
         print("\n可用的因子列表：")
         print(FactorManager.get_factor_info())
         return df
+        
+    # 保存原始列，用于后续验证是否添加了新列
+    original_columns = set(df.columns)
     original_index = df.index.copy()
     result_df = df.copy()
+    
     try:
-        if factor_freq == FactorFrequency.TICK:
-            factor_df = FactorManager.calculate_factors(df, frequency=FactorFrequency.TICK, factor_names=factor_name)
-            if factor_name in factor_df.columns:
-                result_df[factor_name] = factor_df[factor_name]
+        # 所有因子都直接在原始数据上计算，无论频率
+        # 但保留频率信息以便让FactorManager知道要计算的是哪种类型的因子
+        factor_df = FactorManager.calculate_factors(df, frequency=factor_freq, factor_names=factor_name)
+        
+        # 检查因子是否计算成功
+        if factor_name in factor_df.columns:
+            # 直接将因子列赋值给结果DataFrame
+            result_df[factor_name] = factor_df[factor_name].values
+            print(f"因子 {factor_name} 计算完成")
         else:
-            data_processor = FinDataProcessor("data")
-            minute_df = data_processor.resample_data(df, freq='1min')
-            minute_df['TradDay'] = minute_df['DateTime'].dt.date
-            factor_df = FactorManager.calculate_factors(minute_df, frequency=FactorFrequency.MINUTE, factor_names=factor_name)
-            if factor_name in factor_df.columns:
-                result_df = result_df.merge(factor_df[['DateTime', factor_name]], 
-                                          on='DateTime', 
-                                          how='left')
+            print(f"警告: 因子 {factor_name} 未被成功计算")
+        
+        # 恢复原始索引顺序
         result_df = result_df.loc[original_index]
-        print(f"因子 {factor_name} 计算完成")
+        
+        # 验证因子是否成功添加
+        new_columns = set(result_df.columns)
+        added_columns = new_columns - original_columns
+        
+        if factor_name in added_columns:
+            print(f"成功添加因子: {factor_name}")
+        elif factor_name in result_df.columns:
+            print(f"因子列已存在: {factor_name}")
+        else:
+            print(f"警告: 计算后因子 {factor_name} 不在结果DataFrame中")
     except Exception as e:
         print(f"计算因子 {factor_name} 时出错: {str(e)}")
         return df
@@ -188,7 +200,8 @@ def compute_factor(df: pd.DataFrame,
 
 def compute_multiple_factors(df: pd.DataFrame, 
                            factor_names: List[str],
-                           adjust_sign: bool = True) -> pd.DataFrame:
+                           adjust_sign: bool = True,
+                           use_period: int = None) -> pd.DataFrame:
     """
     批量计算多个因子
     
@@ -196,6 +209,7 @@ def compute_multiple_factors(df: pd.DataFrame,
         df: 输入的DataFrame数据
         factor_names: 要计算的因子名称列表
         adjust_sign: 是否根据IC调整因子符号
+        use_period: 使用的return周期，如果提供将使用指定周期的return
         
     Returns:
         添加了所有因子值的原始DataFrame
@@ -203,11 +217,53 @@ def compute_multiple_factors(df: pd.DataFrame,
     result_df = df.copy()
     print(f"\n开始计算 {len(factor_names)} 个因子...")
     
-    # 先计算所有因子
-    for factor_name in factor_names:
-        result_df = compute_factor(result_df, factor_name)
+    # 保存原始列，用于验证
+    original_columns = set(result_df.columns)
     
-    print("\n所有因子计算完成!")
+    # 如果指定了use_period，确保相应的return列存在
+    if use_period is not None:
+        # 检查是否存在指定周期的return列
+        return_col = f'{use_period}period_return'
+        if return_col not in result_df.columns:
+            print(f"警告: 未找到 {return_col} 列，将尝试使用其他可用的return")
+            
+        print(f"使用 {use_period} 周期的收益率计算因子")
+    
+    # 逐个计算因子
+    successful_factors = []
+    failed_factors = []
+    
+    for i, factor_name in enumerate(factor_names):
+        print(f"\n计算因子 {i+1}/{len(factor_names)}: {factor_name}")
+        
+        # 计算单个因子
+        result_df = compute_factor(result_df, factor_name)
+        
+        # 验证因子是否成功添加
+        if factor_name in result_df.columns:
+            successful_factors.append(factor_name)
+            print(f"✓ 因子 {factor_name} 成功添加")
+        else:
+            failed_factors.append(factor_name)
+            print(f"✗ 因子 {factor_name} 添加失败")
+    
+    # 如果需要调整符号
+    if adjust_sign and successful_factors:
+        print("\n调整因子符号...")
+        # 如果指定了使用周期，使用该周期进行调整
+        if use_period is not None:
+            result_df = adjust_factor_signs(result_df, factor_names=successful_factors, return_periods=[use_period])
+        else:
+            result_df = adjust_factor_signs(result_df, factor_names=successful_factors)
+    
+    # 输出计算摘要
+    print(f"\n因子计算完成摘要:")
+    print(f"- 成功计算的因子: {len(successful_factors)}/{len(factor_names)}")
+    print(f"- 失败的因子: {len(failed_factors)}/{len(factor_names)}")
+    
+    if failed_factors:
+        print(f"失败的因子列表: {failed_factors}")
+    
     return result_df
 
 def compute_factors_in_chunks(df: pd.DataFrame, 
@@ -267,8 +323,9 @@ def compute_factors_in_chunks(df: pd.DataFrame,
     # 用于存储每个因子的值
     factor_values = {factor: pd.Series(index=df.index, dtype='float64') for factor in factor_names}
     
-    # 获取因子信息
+    # 获取因子信息和频率
     factor_info = FactorManager.get_factor_info()
+    factor_freqs = {factor: FactorManager.get_factor_frequency(factor) for factor in factor_names}
     
     # 按块处理数据
     for chunk_idx in range(num_chunks):
@@ -286,41 +343,32 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         # 输出处理进度
         print(f"\n处理第 {chunk_idx + 1}/{num_chunks} 块数据 (索引 {start_idx} 到 {end_idx-1}), 大小: {len(chunk_df)} 行")
         
-        # 计算当前块的因子
-        chunk_with_factors = compute_multiple_factors(chunk_df, factor_names, adjust_sign=False)
-        
-        # 如果需要调整符号，在当前块上直接计算和调整
-        if adjust_sign:
+        # 为当前块计算每个因子
+        for factor_name in factor_names:
             try:
-                print(f"调整第 {chunk_idx + 1} 块的因子符号...")
-                # 计算前向收益率
-                test_df = FactorsTester.calculate_forward_returns(chunk_with_factors, periods=return_periods)
+                # 获取因子频率
+                factor_freq = factor_freqs.get(factor_name)
+                if factor_freq is None:
+                    print(f"警告: 因子 {factor_name} 的频率未知，跳过")
+                    continue
                 
-                # 为每个因子计算IC值并调整符号
-                config = FactorTestConfig(return_periods=return_periods)
-                for factor_name in factor_names:
-                    if factor_name in chunk_with_factors.columns:
-                        # 计算IC
-                        ic_df = FactorsTester.calculate_ic(
-                            test_df, 
-                            factor_names=factor_name,
-                            return_periods=return_periods, 
-                            method=config.ic_method
-                        )
-                        
-                        # 获取平均IC
-                        if not ic_df.empty:
-                            ic_col = f'{factor_name}_{return_periods[0]}period_ic'
-                            if ic_col in ic_df.columns:
-                                mean_ic = ic_df[ic_col].mean()
-                                
-                                # 如果IC为负，调整因子符号
-                                if mean_ic < 0:
-                                    chunk_with_factors[factor_name] = -chunk_with_factors[factor_name]
-                                    print(f"  调整因子 {factor_name} 的符号 (块内平均IC: {mean_ic:.4f})")
+                # 直接使用原始数据计算因子
+                factor_df = FactorManager.calculate_factors(chunk_df, frequency=factor_freq, factor_names=factor_name)
+                
+                if factor_name in factor_df.columns:
+                    # 直接将因子值添加到当前块
+                    chunk_df[factor_name] = factor_df[factor_name].values
+                    print(f"因子 {factor_name} 计算完成（块 {chunk_idx + 1}）")
+                else:
+                    print(f"警告: 因子 {factor_name} 未被成功计算（块 {chunk_idx + 1}）")
+                    continue
+                
+                # 释放内存
+                del factor_df
+                gc.collect()
             except Exception as e:
-                print(f"调整第 {chunk_idx + 1} 块因子符号时出错: {str(e)}")
-                print("继续使用未调整的因子值")
+                print(f"计算因子 {factor_name} 时出错 (块 {chunk_idx + 1}): {str(e)}")
+                continue
         
         # 有效数据区域计算：排除头部重叠区域
         valid_start_idx = 0
@@ -335,7 +383,7 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         
         # 提取有效区域的因子值并更新最终结果
         for factor in factor_names:
-            if factor in chunk_with_factors.columns:
+            if factor in chunk_df.columns:
                 # 取当前块的有效区域
                 valid_chunk_indices = chunk_df.index[valid_start_idx:valid_end_idx]
                 original_indices = df.index[start_idx + valid_start_idx:start_idx + valid_end_idx]
@@ -343,11 +391,10 @@ def compute_factors_in_chunks(df: pd.DataFrame,
                 # 将有效区域的因子值赋给最终结果
                 if len(valid_chunk_indices) > 0:
                     # 确保索引匹配
-                    factor_values[factor].loc[original_indices] = chunk_with_factors.loc[valid_chunk_indices, factor].values
+                    factor_values[factor].loc[original_indices] = chunk_df.loc[valid_chunk_indices, factor].values
         
         # 释放内存
-        del chunk_df, chunk_with_factors
-        import gc
+        del chunk_df
         gc.collect()
         print(f"第 {chunk_idx + 1} 块处理完成，已释放内存")
     
@@ -356,6 +403,13 @@ def compute_factors_in_chunks(df: pd.DataFrame,
         if not factor_values[factor].isna().all():  # 确保有计算结果
             final_df[factor] = factor_values[factor]
             print(f"因子 {factor} 添加完成，非空值: {factor_values[factor].count()}/{len(factor_values[factor])}")
+        else:
+            print(f"警告: 因子 {factor} 没有有效值")
+    
+    # 如果需要调整符号
+    if adjust_sign:
+        print("\n调整因子符号...")
+        final_df = adjust_factor_signs_in_chunks(final_df, factor_names=factor_names, return_periods=return_periods)
     
     print("\n分块因子计算完成!")
     return final_df
@@ -483,6 +537,9 @@ def compute_factors_by_contract(df: pd.DataFrame,
     # 初始化结果数据框
     result_df = df.copy()
     
+    # 获取因子频率
+    factor_freqs = {factor: FactorManager.get_factor_frequency(factor) for factor in factor_names}
+    
     # 按合约处理数据
     for i, contract in enumerate(contracts):
         print(f"\n处理合约 {i+1}/{len(contracts)}: {contract}")
@@ -490,21 +547,40 @@ def compute_factors_by_contract(df: pd.DataFrame,
         # 提取当前合约的数据
         contract_df = df[df['InstruID'] == contract].copy()
         
-        try:
-            # 计算当前合约的因子
-            contract_with_factors = compute_multiple_factors(contract_df, factor_names, adjust_sign=False)
-            
-            # 将计算结果更新回结果数据框
-            for factor in factor_names:
-                if factor in contract_with_factors.columns:
-                    result_df.loc[contract_df.index, factor] = contract_with_factors[factor].values
-            
-        except Exception as e:
-            print(f"计算合约 {contract} 的因子时出错: {str(e)}")
+        # 为当前合约计算所有因子
+        for factor_name in factor_names:
+            try:
+                # 获取因子频率
+                factor_freq = factor_freqs.get(factor_name)
+                if factor_freq is None:
+                    print(f"警告: 因子 {factor_name} 的频率未知，跳过")
+                    continue
+                
+                print(f"计算因子: {factor_name} (合约: {contract})")
+                
+                # 直接使用原始数据计算因子
+                factor_df = FactorManager.calculate_factors(contract_df, frequency=factor_freq, factor_names=factor_name)
+                
+                if factor_name in factor_df.columns:
+                    # 将因子值添加到合约数据中
+                    contract_df[factor_name] = factor_df[factor_name].values
+                    print(f"因子 {factor_name} 计算完成 (合约: {contract})")
+                else:
+                    print(f"警告: 因子 {factor_name} 未被成功计算 (合约: {contract})")
+                    continue
+                
+                # 将计算结果更新回结果数据框
+                result_df.loc[contract_df.index, factor_name] = contract_df[factor_name].values
+                
+                # 释放内存
+                del factor_df
+                gc.collect()
+            except Exception as e:
+                print(f"计算因子 {factor_name} 时出错 (合约: {contract}): {str(e)}")
+                continue
         
         # 释放内存
         del contract_df
-        import gc
         gc.collect()
     
     # 如果需要调整符号
@@ -608,415 +684,154 @@ def adjust_factor_signs(df: pd.DataFrame,
         
     return result_df
 
-def compute_and_save_by_date(data_dir: str,
-                            start_date: Union[str, datetime.datetime],
-                            end_date: Union[str, datetime.datetime],
-                            factor_names: List[str],
-                            output_dir: str = "factor_data_by_date",
-                            chunk_size: int = 500000,
-                            overlap_size: int = 100000,
-                            adjust_sign: bool = True,
-                            return_periods: List[int] = None) -> None:
+# 添加因子平滑函数
+def smooth_factor(df: pd.DataFrame, 
+                 factor_name: str, 
+                 window: int = 5, 
+                 method: str = 'sma') -> pd.DataFrame:
     """
-    按日期计算因子并分别保存，解决内存问题
+    平滑单个因子
     
     Args:
-        data_dir: 原始数据所在目录
-        start_date: 开始日期
-        end_date: 结束日期
-        factor_names: 要计算的因子列表
-        output_dir: 输出目录，将按日期保存子文件
-        chunk_size: 计算因子时的分块大小
-        overlap_size: 计算因子时的重叠区域大小
-        adjust_sign: 是否调整因子符号
-        return_periods: 收益率周期列表，用于计算IC和调整符号
-    """
-    # 注册所有因子
-    register_all_factors()
-    
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 转换日期
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
-    
-    # 生成日期列表
-    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-    trading_dates = [date for date in date_range if date.weekday() < 5]  # 简单过滤非交易日
-    
-    print(f"将处理从 {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')} 的数据")
-    print(f"预计处理 {len(trading_dates)} 个交易日")
-    
-    # 初始化数据处理器
-    data_processor = FinDataProcessor(data_dir)
-    
-    # 加载因子管理器获取因子信息
-    factor_info = FactorManager.get_factor_info()
-    available_factors = [f for f in factor_names if f in factor_info['name'].tolist()]
-    
-    if not available_factors:
-        print("错误：指定的因子都不可用")
-        return
-    
-    print(f"将计算以下因子: {available_factors}")
-    
-    # 设置默认的收益率周期
-    if return_periods is None:
-        return_periods = [10]
-    
-    # 逐个日期处理
-    processed_dates = []
-    for current_date in trading_dates:
-        date_str = current_date.strftime('%Y%m%d')
-        output_file = os.path.join(output_dir, f"factors_{date_str}.feather")
-        
-        # 如果文件已存在且不强制重新计算，则跳过
-        if os.path.exists(output_file):
-            print(f"日期 {date_str} 的因子数据已存在，跳过计算")
-            processed_dates.append(date_str)
-            continue
-        
-        try:
-            print(f"\n处理日期: {date_str}")
-            
-            # 加载当日数据
-            daily_file = os.path.join(data_dir, f"{date_str}.feather")
-            if not os.path.exists(daily_file):
-                print(f"日期 {date_str} 的数据文件不存在，跳过")
-                continue
-            
-            try:
-                df = pd.read_feather(daily_file)
-                print(f"加载了 {len(df)} 行数据")
-            except Exception as e:
-                print(f"读取文件 {daily_file} 时出错: {str(e)}")
-                continue
-            
-            if df.empty:
-                print(f"日期 {date_str} 的数据为空，跳过")
-                continue
-            
-            # 计算因子
-            print(f"计算因子...")
-            df_with_factors = compute_multiple_factors(df, factor_names, adjust_sign=False)
-            
-            # 计算收益率（如果需要）
-            if adjust_sign or any(f"{p}period_return" not in df_with_factors.columns for p in return_periods):
-                print(f"计算收益率...")
-                
-                # 确保TradDay列存在
-                if 'TradDay' not in df_with_factors.columns and 'DateTime' in df_with_factors.columns:
-                    df_with_factors['TradDay'] = df_with_factors['DateTime'].dt.date
-                
-                # 计算收益率
-                for period in return_periods:
-                    col_name = f'{period}period_return'
-                    if col_name not in df_with_factors.columns:
-                        df_with_factors[col_name] = df_with_factors.groupby('InstruID')['mid_price'].transform(
-                            lambda x: x.pct_change(period).shift(-period)
-                        )
-            
-            # 如果需要调整符号
-            if adjust_sign:
-                print(f"调整因子符号...")
-                for factor in available_factors:
-                    # 计算IC
-                    for period in return_periods:
-                        return_col = f'{period}period_return'
-                        if return_col in df_with_factors.columns and factor in df_with_factors.columns:
-                            # 选择有效数据
-                            valid_data = df_with_factors[[factor, return_col]].dropna()
-                            if len(valid_data) >= 30:  # 最小样本量
-                                # 使用spearman相关系数
-                                ic = stats.spearmanr(valid_data[factor], valid_data[return_col])[0]
-                                if not np.isnan(ic) and ic < 0:
-                                    print(f"  调整因子 {factor} 的符号 (IC={ic:.4f})")
-                                    df_with_factors[factor] = -df_with_factors[factor]
-                                    break  # 一旦调整就退出循环
-            
-            # 保存结果
-            print(f"保存结果到: {output_file}")
-            df_with_factors.to_feather(output_file)
-            processed_dates.append(date_str)
-            
-            # 释放内存
-            del df, df_with_factors
-            import gc
-            gc.collect()
-            
-        except Exception as e:
-            print(f"处理日期 {date_str} 时出错: {str(e)}")
-            import traceback
-            print(traceback.format_exc())
-            continue
-    
-    # 保存处理成功的日期列表
-    dates_file = os.path.join(output_dir, "processed_dates.txt")
-    with open(dates_file, 'w') as f:
-        for date in processed_dates:
-            f.write(f"{date}\n")
-    
-    print(f"\n按日期计算因子完成!")
-    print(f"成功处理了 {len(processed_dates)}/{len(trading_dates)} 个交易日")
-    print(f"结果保存在目录: {output_dir}")
-    print(f"处理成功的日期列表保存在: {dates_file}")
-
-def load_factors_by_date_range(factors_dir: str,
-                              start_date: Union[str, datetime.datetime] = None,
-                              end_date: Union[str, datetime.datetime] = None,
-                              factor_names: List[str] = None) -> pd.DataFrame:
-    """
-    加载指定日期范围内的因子数据
-    
-    Args:
-        factors_dir: 因子数据目录，包含按日期保存的feather文件
-        start_date: 开始日期，如果为None则从最早的日期开始
-        end_date: 结束日期，如果为None则到最晚的日期结束
-        factor_names: 要加载的因子列表，如果为None则加载所有因子
+        df: 输入DataFrame，必须包含factor_name列
+        factor_name: 要平滑的因子名称
+        window: 平滑窗口大小
+        method: 平滑方法，'sma'=简单移动平均，'ema'=指数移动平均
         
     Returns:
-        合并后的DataFrame
+        添加了平滑因子的DataFrame
     """
-    # 获取所有可用的日期文件
-    files = os.listdir(factors_dir)
-    factor_files = [f for f in files if f.startswith("factors_") and f.endswith(".feather")]
+    result_df = df.copy()
     
-    if not factor_files:
-        raise ValueError(f"目录 {factors_dir} 中没有找到因子数据文件")
+    # 检查因子是否存在
+    if factor_name not in result_df.columns:
+        raise ValueError(f"因子 '{factor_name}' 不在数据中")
     
-    # 转换日期
-    if start_date is not None:
-        start_date = pd.to_datetime(start_date)
+    # 生成平滑因子名称
+    method_suffix = 'sma' if method == 'sma' else 'ema'
+    smoothed_name = f"{factor_name}_{method_suffix}{window}"
     
-    if end_date is not None:
-        end_date = pd.to_datetime(end_date)
+    # 确保数据已按时间排序
+    if 'DateTime' in result_df.columns:
+        result_df = result_df.sort_values(['InstruID', 'DateTime'])
+    elif 'TradDay' in result_df.columns and 'UpdateTime' in result_df.columns:
+        result_df = result_df.sort_values(['InstruID', 'TradDay', 'UpdateTime'])
+    elif 'date' in result_df.columns:
+        result_df = result_df.sort_values(['InstruID', 'date'])
     
-    # 解析文件名中的日期
-    file_dates = []
-    for file in factor_files:
-        try:
-            date_str = file[8:16]  # 提取文件名中的日期部分 (factors_YYYYMMDD.feather)
-            date = pd.to_datetime(date_str)
-            file_dates.append((date, file))
-        except:
-            continue
+    # 应用平滑
+    if method == 'sma':
+        # 简单移动平均
+        result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+            lambda x: x.rolling(window=window, min_periods=1).mean()
+        )
+    elif method == 'ema':
+        # 指数移动平均
+        result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+            lambda x: x.ewm(span=window, min_periods=1).mean()
+        )
+    else:
+        raise ValueError(f"不支持的平滑方法: {method}，支持的方法有 'sma', 'ema'")
     
-    # 按日期排序
-    file_dates.sort(key=lambda x: x[0])
-    
-    # 筛选日期范围
-    if start_date is not None:
-        file_dates = [(date, file) for date, file in file_dates if date >= start_date]
-    
-    if end_date is not None:
-        file_dates = [(date, file) for date, file in file_dates if date <= end_date]
-    
-    if not file_dates:
-        raise ValueError(f"在指定的日期范围内没有找到因子数据文件")
-    
-    # 加载并合并数据
-    all_data = []
-    total_files = len(file_dates)
-    
-    print(f"将加载 {total_files} 个日期的因子数据")
-    
-    for i, (date, file) in enumerate(file_dates):
-        try:
-            print(f"加载 {i+1}/{total_files}: {date.strftime('%Y-%m-%d')} ({file})")
-            filepath = os.path.join(factors_dir, file)
-            df = pd.read_feather(filepath)
-            
-            # 如果指定了因子名称，则只保留需要的列
-            if factor_names is not None:
-                # 确保保留基本列
-                base_cols = ['InstruID', 'DateTime', 'TradDay', 'date']
-                keep_cols = [col for col in base_cols if col in df.columns]
-                # 添加指定的因子列
-                for factor in factor_names:
-                    if factor in df.columns:
-                        keep_cols.append(factor)
-                # 添加收益率列
-                return_cols = [col for col in df.columns if 'period_return' in col]
-                keep_cols.extend(return_cols)
-                
-                # 只保留需要的列
-                df = df[list(set(keep_cols))]
-            
-            all_data.append(df)
-            
-            # 释放内存
-            del df
-            import gc
-            gc.collect()
-            
-        except Exception as e:
-            print(f"加载文件 {file} 时出错: {str(e)}")
-            continue
-    
-    if not all_data:
-        raise ValueError("所有文件加载失败")
-    
-    # 合并所有数据
-    print("合并所有数据...")
-    result = pd.concat(all_data, ignore_index=True)
-    
-    # 清理内存
-    del all_data
-    gc.collect()
-    
-    # 确保数据按时间排序
-    if 'DateTime' in result.columns:
-        result = result.sort_values(['DateTime', 'InstruID'])
-    elif 'TradDay' in result.columns:
-        result = result.sort_values(['TradDay', 'InstruID'])
-    elif 'date' in result.columns:
-        result = result.sort_values(['date', 'InstruID'])
-    
-    print(f"成功加载了 {len(result)} 行数据")
-    
-    return result
+    print(f"平滑因子 {factor_name} 完成 -> {smoothed_name}")
+    return result_df
 
-def create_batch_generator(factors_dir: str,
-                          batch_size: int = 5,
-                          factor_names: List[str] = None,
-                          return_col: str = '10period_return') -> Iterator[pd.DataFrame]:
+def smooth_factors(df: pd.DataFrame, 
+                  factor_names: List[str], 
+                  windows: Union[List[int], int] = 5, 
+                  methods: Union[List[str], str] = 'sma',
+                  register_factors: bool = True) -> Tuple[pd.DataFrame, List[str]]:
     """
-    创建按批次加载因子数据的生成器
+    批量平滑多个因子
     
     Args:
-        factors_dir: 因子数据目录，包含按日期保存的feather文件
-        batch_size: 每批加载的日期数量
-        factor_names: 要加载的因子列表，如果为None则加载所有因子
-        return_col: 收益率列名
+        df: 输入DataFrame，必须包含factor_names列
+        factor_names: 要平滑的因子名称列表
+        windows: 平滑窗口大小，可以是单个整数或与factor_names等长的列表
+        methods: 平滑方法，可以是单个字符串或与factor_names等长的列表
+        register_factors: 是否将平滑因子注册到FactorManager中
         
     Returns:
-        生成器，每次返回一批数据
+        (添加了平滑因子的DataFrame, 生成的平滑因子名称列表)
     """
-    # 获取并排序所有处理过的日期
-    try:
-        with open(os.path.join(factors_dir, "processed_dates.txt"), 'r') as f:
-            dates = [line.strip() for line in f.readlines()]
-    except:
-        # 如果没有日期列表文件，则从目录中获取所有日期
-        files = os.listdir(factors_dir)
-        dates = []
-        for file in files:
-            if file.startswith("factors_") and file.endswith(".feather"):
-                try:
-                    date_str = file[8:16]  # 提取文件名中的日期部分
-                    dates.append(date_str)
-                except:
-                    continue
+    result_df = df.copy()
+    smoothed_names = []
     
-    # 按日期排序
-    dates.sort()
+    # 规范化windows参数
+    if isinstance(windows, int):
+        windows = [windows] * len(factor_names)
+    elif len(windows) != len(factor_names):
+        raise ValueError("windows参数长度必须为1或与factor_names相同")
     
-    # 分批处理
-    total_dates = len(dates)
-    batches = (total_dates + batch_size - 1) // batch_size
+    # 规范化methods参数
+    if isinstance(methods, str):
+        methods = [methods] * len(factor_names)
+    elif len(methods) != len(factor_names):
+        raise ValueError("methods参数长度必须为1或与factor_names相同")
     
-    print(f"共有 {total_dates} 个日期，将分成 {batches} 批处理")
-    
-    for i in range(batches):
-        start_idx = i * batch_size
-        end_idx = min(start_idx + batch_size, total_dates)
-        batch_dates = dates[start_idx:end_idx]
+    # 逐个因子处理
+    for i, factor_name in enumerate(factor_names):
+        window = windows[i]
+        method = methods[i]
         
-        print(f"加载第 {i+1}/{batches} 批，包含日期: {batch_dates}")
+        # 检查因子是否存在
+        if factor_name not in result_df.columns:
+            print(f"警告: 因子 '{factor_name}' 不在数据中，跳过")
+            continue
         
-        # 加载这一批的数据
-        batch_data = []
-        for date_str in batch_dates:
-            try:
-                file_path = os.path.join(factors_dir, f"factors_{date_str}.feather")
-                if not os.path.exists(file_path):
-                    print(f"文件不存在: {file_path}")
-                    continue
-                
-                df = pd.read_feather(file_path)
-                
-                # 如果指定了因子名称，则只保留需要的列
-                if factor_names is not None:
-                    # 确保保留基本列
-                    base_cols = ['InstruID', 'DateTime', 'TradDay', 'date']
-                    keep_cols = [col for col in base_cols if col in df.columns]
-                    # 添加指定的因子列
-                    for factor in factor_names:
-                        if factor in df.columns:
-                            keep_cols.append(factor)
-                    # 添加指定的收益率列
-                    if return_col in df.columns:
-                        keep_cols.append(return_col)
-                    
-                    # 只保留需要的列
-                    df = df[list(set(keep_cols))]
-                
-                batch_data.append(df)
-                
-            except Exception as e:
-                print(f"加载日期 {date_str} 数据时出错: {str(e)}")
-                continue
+        # 生成平滑因子名称
+        method_suffix = 'sma' if method == 'sma' else 'ema'
+        smoothed_name = f"{factor_name}_{method_suffix}{window}"
         
-        if batch_data:
-            # 合并批次数据
-            batch_df = pd.concat(batch_data, ignore_index=True)
-            
-            # 清理内存
-            del batch_data
-            import gc
-            gc.collect()
-            
-            # 确保结果中包含必要的列
-            required_cols = factor_names if factor_names else []
-            if return_col:
-                required_cols.append(return_col)
-            
-            missing_cols = [col for col in required_cols if col not in batch_df.columns]
-            if missing_cols:
-                print(f"警告: 批次数据中缺少以下列: {missing_cols}")
-            
-            # 返回这一批数据
-            yield batch_df
+        # 应用平滑
+        if method == 'sma':
+            # 简单移动平均
+            result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean()
+            )
+        elif method == 'ema':
+            # 指数移动平均
+            result_df[smoothed_name] = result_df.groupby('InstruID')[factor_name].transform(
+                lambda x: x.ewm(span=window, min_periods=1).mean()
+            )
         else:
-            print(f"第 {i+1} 批没有有效数据，跳过")
+            print(f"警告: 不支持的平滑方法: {method}，跳过因子 {factor_name}")
+            continue
+        
+        # 注册平滑因子
+        if register_factors:
+            try:
+                FactorManager.register_smoothed_factor(factor_name, window, method)
+                print(f"因子 {smoothed_name} 已注册到FactorManager")
+            except Exception as e:
+                print(f"注册因子 {smoothed_name} 失败: {str(e)}")
+        
+        smoothed_names.append(smoothed_name)
+        print(f"平滑因子 {factor_name} 完成 -> {smoothed_name}")
+    
+    print(f"批量平滑完成，共添加 {len(smoothed_names)} 个平滑因子")
+    return result_df, smoothed_names
 
 if __name__ == "__main__":
-    import argparse
+    df = pd.read_feather("data.feather")
     
-    parser = argparse.ArgumentParser(description='计算因子并按日期保存')
-    parser.add_argument('--data-dir', type=str, default='data', help='数据目录')
-    parser.add_argument('--output-dir', type=str, default='factor_data_by_date', help='输出目录')
-    parser.add_argument('--start-date', type=str, default='2022-01-01', help='开始日期，格式：YYYY-MM-DD')
-    parser.add_argument('--end-date', type=str, default='2022-12-31', help='结束日期，格式：YYYY-MM-DD')
-    parser.add_argument('--factor', type=str, default=None, help='要计算的因子名称，如果不指定则计算所有因子')
-    args = parser.parse_args()
+    # 示例1：计算单个因子
+    df_with_factor = compute_factor(df, factor_name="price_reversal")
     
-    # 注册所有因子
-    register_all_factors()
+    # 示例2：批量计算多个因子
+    factors_to_compute = ['price_reversal', 'kyle_lambda', 'unit_return_volume']
+    df_with_factors = compute_multiple_factors(df, factors_to_compute)
     
-    # 确定要计算的因子
-    if args.factor:
-        factor_names = [args.factor]
-    else:
-        # 获取所有因子
-        factor_info = FactorManager.get_factor_info()
-        factor_names = factor_info['name'].tolist()
+    # 示例3：计算并测试因子
+    results = run_factor_compute(df, factor_name="price_reversal")
     
-    # 按日期计算并保存因子
-    compute_and_save_by_date(
-        data_dir=args.data_dir,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        factor_names=factor_names,
-        output_dir=args.output_dir
+    # 示例4：使用自定义配置测试因子
+    custom_config = FactorTestConfig(
+        ic_method='pearson',
+        ic_threshold=0.03,
+        ir_threshold=0.6
     )
+    results = run_factor_compute(df, factor_name="weighted_momentum_10t", config=custom_config, return_periods=[100])
     
-    print("\n示例：如何加载计算好的因子数据")
-    print("方法1：加载指定日期范围的所有数据")
-    print("    df = load_factors_by_date_range('factor_data_by_date', '2022-01-01', '2022-01-31')")
-    
-    print("\n方法2：使用批次生成器逐批加载数据")
-    print("    for batch_df in create_batch_generator('factor_data_by_date', batch_size=5):")
-    print("        # 处理每一批数据")
-    print("        process_batch(batch_df)")
+    # 示例5：显示所有因子
+    run_factor_compute(df)
